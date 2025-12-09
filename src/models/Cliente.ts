@@ -1,6 +1,7 @@
 import mongoose, { Schema } from "mongoose";
 
 export interface ClienteType {
+  _id?: string;
   cod_pes?: number;
   nome_pes?: string;
   tipo_pes?: number;
