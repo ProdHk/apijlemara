@@ -1,4 +1,4 @@
-import Console, { ConsoleData } from "lib/Console";
+import Console, { ConsoleData } from "../lib/Console";
 import Obra, {
   FotosType,
   InfoSiteType,
