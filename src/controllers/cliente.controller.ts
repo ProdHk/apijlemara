@@ -1,5 +1,5 @@
-import Console, { ConsoleData } from "lib/Console";
-import Cliente, { ClienteType } from "models/Cliente";
+import Console, { ConsoleData } from "../lib/Console";
+import Cliente, { ClienteType } from "../models/Cliente";
 
 interface ResponseUauCliente {
   cod_pes?: number;
@@ -306,8 +306,8 @@ export default class ClienteController {
         message: `Buscando cliente por cod_pes ${cod_pes}...`,
       });
 
-      const cliente = await Cliente.findOne({ cod_pes }).lean();
-
+      const cliente = await Cliente.find({ cod_pes: Number(cod_pes) }).lean() as ClienteType
+      console.log(cliente)
       if (!cliente) {
         Console({ type: "error", message: "Cliente não encontrado." });
         return {
@@ -817,9 +817,9 @@ export default class ClienteController {
          data: null,
        };
      }
- 
+
      const atd = atendimentoId?.trim();
- 
+
      if (!atd) {
        return {
          status: false,
@@ -827,19 +827,19 @@ export default class ClienteController {
          data: null,
        };
      }
- 
+
      try {
        Console({
          type: "log",
          message: `Registrando atendimento ${atd} para cliente ${clienteId}...`,
        });
- 
+
        const updated = await Cliente.findByIdAndUpdate(
          clienteId,
          { $addToSet: { atendimentos: atd } },
          { new: true }
        ).lean();
- 
+
        if (!updated) {
          Console({ type: "error", message: "Cliente não encontrado." });
          return {
@@ -848,12 +848,12 @@ export default class ClienteController {
            data: null,
          };
        }
- 
+
        Console({
          type: "success",
          message: "Atendimento registrado com sucesso!",
        });
- 
+
        return {
          status: true,
          message: "Atendimento registrado com sucesso!",
@@ -872,7 +872,7 @@ export default class ClienteController {
        };
      }
    }
- 
+
    async listarAtendimentos(clienteId: string) {
      if (!clienteId) {
        return {
@@ -881,17 +881,17 @@ export default class ClienteController {
          data: null,
        };
      }
- 
+
      try {
        Console({
          type: "log",
          message: `Listando atendimentos do cliente ${clienteId}...`,
        });
- 
+
        const cliente = await Cliente.findById(clienteId, {
          atendimentos: 1,
        }).lean();
- 
+
        if (!cliente) {
          Console({ type: "error", message: "Cliente não encontrado." });
          return {
@@ -900,14 +900,14 @@ export default class ClienteController {
            data: null,
          };
        }
- 
+
        const atendimentos = cliente.atendimentos ?? [];
- 
+
        Console({
          type: "success",
          message: "Atendimentos listados com sucesso!",
        });
- 
+
        return {
          status: true,
          message: "Atendimentos listados com sucesso!",
