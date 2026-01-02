@@ -1,77 +1,124 @@
+// controllers/ClienteController.ts
+import { Request, Response } from "express";
 import Console, { ConsoleData } from "../lib/Console";
 import Cliente, { ClienteType } from "../models/Cliente";
 
-interface ResponseUauCliente {
-  cod_pes?: number;
-  nome_pes?: string;
-  tipo_pes?: number;
-  cpf_pes?: string;
-  dtcad_pes?: Date;
-  dtnasc_pes?: Date;
-  IntExt_pes?: number;
-  UsrCad_pes?: string;
-  UsrAlt_pes?: string;
-  Status_pes?: number;
-  Tratamento_pes?: string;
-  Email_pes?: string;
-  EndWWW_pes?: string;
-  Matricula_Pes?: string | null;
-  Empreendimento_Pes?: string | null;
-  ForCli_Pes?: string | null;
-  Aval_Prod_Serv_Pes?: string | null;
-  Atd_Entrega_Pes?: string | null;
-  AtInat_pes?: number;
-  DataAlt_pes?: Date;
-  NomeFant_Pes?: string;
-  Anexos_pes?: number;
-  InscrMunic_pes?: string;
-  inscrest_pes?: string;
-  Login_pes?: string;
-  Senha_pes?: string;
-  CNAE_pes?: string | null;
-  DataCadPortal_pes?: Date;
-  CadastradoPrefeituraGyn_pes?: boolean;
-  HabilitadoRiscoSacado_pes?: boolean;
-  CEI_Pes?: string | null;
-  IntegradoEDI_pes?: string | null;
-  BloqueioLgpd_Pes?: number;
-  CliDDA_PPes?: string | null;
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
+
+type ResponseType<T = any> = {
+  status: boolean;
+  message: string;
+  data: T;
+};
+
+function ok<T>(res: Response, payload: ResponseType<T>) {
+  return res.status(200).json(payload);
 }
+
+function fail(res: Response, error: unknown, fallback = "Erro interno") {
+  const message = error instanceof Error ? error.message : fallback;
+  Console({ type: "error", message });
+  ConsoleData({ type: "error", data: error });
+  return res.status(500).json({ status: false, message, data: null });
+}
+
+function onlyDigits(v: any) {
+  return String(v ?? "").replace(/\D+/g, "");
+}
+
+function escapeRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function clampInt(v: any, min: number, max: number, fallback: number) {
+  const n = parseInt(String(v ?? ""), 10);
+  if (Number.isNaN(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function toBool(v: any) {
+  return String(v ?? "false") === "true";
+}
+
+/* -------------------------------------------------------------------------- */
+/* Config                                                                     */
+/* -------------------------------------------------------------------------- */
+
+const MAX_LIMIT = 50;
+const DEFAULT_LIMIT = 12;
+
+const LIST_PROJECTION = {
+  cod_pes: 1,
+  nome_pes: 1,
+  tipo_pes: 1,
+  cpf_pes: 1,
+  Email_pes: 1,
+  numeroWhatsapp: 1,
+  Status_pes: 1,
+  BloqueioLgpd_Pes: 1,
+  dtcad_pes: 1,
+  DataAlt_pes: 1,
+  Empreendimento_Pes: 1,
+  Matricula_Pes: 1,
+  UsrCad_pes: 1,
+  UsrAlt_pes: 1,
+  atendimentos: 1,
+  updatedAt: 1,
+  createdAt: 1,
+} as const;
+
+/**
+ * Sort seguro (whitelist)
+ * - ordenação padrão: DataAlt_pes desc
+ */
+const SORT_FIELDS: Record<string, string> = {
+  nome: "nome",            // ou "nome_pes" se padronizar depois
+  codigo: "codPes",
+  status: "Status_pes",
+  cadastro: "createdAt",
+  alteracao: "updatedAt",
+  updatedAt: "updatedAt",
+  createdAt: "createdAt",
+};
+
+
+type ListQuery = {
+  page: number;
+  limit: number;
+  q: string;
+  tab: "todos" | "ativos" | "bloqueados";
+  onlyHasWhatsapp: boolean;
+  hideLgpdBlocked: boolean;
+  sortKey: keyof typeof SORT_FIELDS | "atendimentos" | string;
+  sortDir: "asc" | "desc";
+};
+
+/* -------------------------------------------------------------------------- */
+/* Controller                                                                 */
+/* -------------------------------------------------------------------------- */
 
 export default class ClienteController {
   /* -------------------------------------------------------------------------- */
-  /*  ERP / CADASTRO BÁSICO                                                    */
+  /* ERP / CADASTRO BÁSICO                                                     */
   /* -------------------------------------------------------------------------- */
 
-  async cadastrar(payload: ResponseUauCliente) {
+  async cadastrar(payload: any) {
     if (!payload) {
       Console({ type: "error", message: "Payload vazio." });
-      return {
-        status: false,
-        message: "Payload vazio.",
-        data: null,
-      };
+      return { status: false, message: "Payload vazio.", data: null };
     }
 
     const cod = payload.cod_pes;
 
-    if (!cod && cod !== 0) {
-      Console({
-        type: "error",
-        message: "Código (cod_pes) do cliente é obrigatório.",
-      });
-      return {
-        status: false,
-        message: "Código (cod_pes) do cliente é obrigatório.",
-        data: null,
-      };
+    if (cod === undefined || cod === null) {
+      Console({ type: "error", message: "Código (cod_pes) do cliente é obrigatório." });
+      return { status: false, message: "Código (cod_pes) do cliente é obrigatório.", data: null };
     }
 
     try {
-      Console({
-        type: "log",
-        message: `Cadastrando/atualizando cliente ${cod}...`,
-      });
+      Console({ type: "log", message: `Cadastrando/atualizando cliente ${cod}...` });
 
       const cliente = await Cliente.findOneAndUpdate(
         { cod_pes: cod },
@@ -80,850 +127,338 @@ export default class ClienteController {
       ).lean();
 
       if (!cliente) {
-        Console({
-          type: "error",
-          message: "Erro ao cadastrar cliente.",
-        });
-        return {
-          status: false,
-          message: "Erro ao cadastrar cliente.",
-          data: null,
-        };
+        return { status: false, message: "Erro ao cadastrar cliente.", data: null };
       }
-
-      Console({
-        type: "success",
-        message: "Cliente cadastrado com sucesso!",
-      });
 
       return {
         status: true,
         message: "Cliente cadastrado com sucesso!",
-        data: {
-          ...cliente,
-          _id: String(cliente._id),
-        } as ClienteType,
+        data: { ...cliente, _id: String(cliente._id) } as ClienteType,
       };
     } catch (error) {
       Console({ type: "error", message: "Erro ao cadastrar cliente." });
       ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao cadastrar cliente.",
-        data: null,
-      };
+      return { status: false, message: "Erro ao cadastrar cliente.", data: null };
     }
   }
 
-  async sincronizarErp(payload: ResponseUauCliente) {
+  async sincronizarErp(payload: any) {
     if (!payload) {
       Console({ type: "error", message: "Payload vazio." });
-      return {
-        status: false,
-        message: "Payload vazio.",
-        data: null,
-      };
+      return { status: false, message: "Payload vazio.", data: null };
     }
 
     try {
-      Console({
-        type: "log",
-        message: "Sincronizando cliente (via cod_pes)...",
-      });
-
+      Console({ type: "log", message: "Sincronizando cliente (via cod_pes)..." });
       const result = await this.cadastrar(payload);
-
-      if (!result.status || !result.data) {
-        return result;
-      }
+      if (!result.status) return result;
 
       return {
         status: true,
         message: "Cliente sincronizado com sucesso!",
-        data: {
-          ...result.data,
-          _id: String(result.data._id),
-        },
+        data: { ...result.data, _id: String(result?.data?._id) },
       };
     } catch (error) {
       Console({ type: "error", message: "Erro ao sincronizar cliente." });
       ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao sincronizar cliente.",
-        data: null,
-      };
+      return { status: false, message: "Erro ao sincronizar cliente.", data: null };
     }
   }
 
-  async sincronizarListaErp(payload: ResponseUauCliente[]) {
+  async sincronizarListaErp(payload: any[]) {
     if (!payload || !payload.length) {
       Console({ type: "error", message: "Payload vazio." });
-      return {
-        status: false,
-        message: "Payload vazio.",
-        data: null,
-      };
+      return { status: false, message: "Payload vazio.", data: null };
     }
 
     try {
       const total = payload.length;
       let success = 0;
-      let fail = 0;
+      let failCount = 0;
 
-      Console({
-        type: "log",
-        message: `Sincronizando lista de clientes (${total})...`,
-      });
+      Console({ type: "log", message: `Sincronizando lista de clientes (${total})...` });
 
       for (const cli of payload) {
-        const cod = cli.cod_pes;
+        const cod = cli?.cod_pes;
 
-        if (!cod && cod !== 0) {
-          Console({
-            type: "warn",
-            message: "cod_pes vazio, ignorando registro.",
-          });
-          fail++;
+        if (cod === undefined || cod === null) {
+          Console({ type: "warn", message: "cod_pes vazio, ignorando registro." });
+          failCount++;
           continue;
         }
 
         try {
           const result = await this.cadastrar({ ...cli, cod_pes: cod });
-
           if (!result.status) {
-            fail++;
-            Console({
-              type: "warn",
-              message: `Falha ao sincronizar cliente ${cod}: ${result.message}`,
-            });
+            failCount++;
+            Console({ type: "warn", message: `Falha ao sincronizar cliente ${cod}: ${result.message}` });
             continue;
           }
-
-          Console({
-            type: "success",
-            message: `Cliente ${cod} sincronizado com sucesso!`,
-          });
           success++;
         } catch (err) {
-          fail++;
-          Console({
-            type: "error",
-            message: `Erro ao sincronizar cliente ${cod}.`,
-          });
+          failCount++;
+          Console({ type: "error", message: `Erro ao sincronizar cliente ${cod}.` });
           ConsoleData({ type: "error", data: err });
         }
       }
 
-      const message = `Total de clientes sincronizados: ${success} de ${total}, ${fail} falhas.`;
+      const message = `Total de clientes sincronizados: ${success} de ${total}, ${failCount} falhas.`;
       Console({ type: "success", message });
 
-      return {
-        status: true,
-        message,
-        data: { total, success, fail },
-      };
+      return { status: true, message, data: { total, success, fail: failCount } };
     } catch (error) {
-      Console({
-        type: "error",
-        message: "Erro ao sincronizar clientes.",
-      });
+      Console({ type: "error", message: "Erro ao sincronizar clientes." });
       ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao sincronizar clientes.",
-        data: null,
-      };
+      return { status: false, message: "Erro ao sincronizar clientes.", data: null };
     }
   }
 
   /* -------------------------------------------------------------------------- */
-  /*  BUSCAS PRINCIPAIS                                                        */
+  /* BUSCAS (HTTP)                                                             */
   /* -------------------------------------------------------------------------- */
 
-  async buscarPorId(clienteId: string) {
-    if (!clienteId) {
-      return {
-        status: false,
-        message: "ID do cliente não fornecido.",
-        data: null,
-      };
-    }
+  /**
+   * GET /api/cliente
+   * Query:
+   *  - page, limit
+   *  - q
+   *  - tab: todos | ativos | bloqueados
+   *  - onlyHasWhatsapp=true|false
+   *  - hideLgpdBlocked=true|false
+   *  - sortKey: nome|codigo|status|cadastro|alteracao|updatedAt|createdAt
+   *  - sortDir: asc|desc
+   *
+   * Objetivo: rápido e previsível
+   * - projection fixa (LIST_PROJECTION)
+   * - paginação sempre
+   * - filtros simples
+   * - busca: números -> igualdade (cpf/whats/cod); texto -> prefix (^) para não virar fullscan pesado
+   */
+  async buscarClientes(req: Request, res: Response) {
+    const startedAt = Date.now();
+    Console({ type: "log", message: "GET /api/cliente (list)" });
 
     try {
-      Console({
-        type: "log",
-        message: `Buscando cliente por _id ${clienteId}...`,
-      });
+      const query: ListQuery = {
+        page: clampInt(req.query.page, 1, 999999, 1),
+        limit: clampInt(req.query.limit, 1, MAX_LIMIT, DEFAULT_LIMIT),
+        q: String(req.query.q ?? ""),
+        tab: (String(req.query.tab ?? "todos") as any) ?? "todos",
+        onlyHasWhatsapp: toBool(req.query.onlyHasWhatsapp),
+        hideLgpdBlocked: toBool(req.query.hideLgpdBlocked),
+        sortKey: String(req.query.sortKey ?? "alteracao"),
+        sortDir: (String(req.query.sortDir ?? "desc") === "asc" ? "asc" : "desc"),
+      };
 
-      const cliente = await Cliente.findById(clienteId).lean();
+      const skip = (query.page - 1) * query.limit;
+
+      const filter: any = {};
+
+      // tabs
+      if (query.tab === "ativos") filter.Status_pes = 1;
+      if (query.tab === "bloqueados") filter.Status_pes = 2;
+
+      // switches
+      if (query.onlyHasWhatsapp) {
+        filter.numeroWhatsapp = { $exists: true, $ne: null };
+      }
+
+      if (query.hideLgpdBlocked) {
+        // se BloqueioLgpd_Pes for 1/true como bloqueio
+        filter.BloqueioLgpd_Pes = { $ne: 1 };
+      }
+
+      function escapeRegex(input: string) {
+        return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      }
+
+      function normalizeQ(q: string) {
+        return q.trim().replace(/\s+/g, " ");
+      }
+
+      function isProbablyEmail(q: string) {
+        return q.includes("@") && q.includes(".");
+      }
+
+
+
+      // search
+      const qRaw = normalizeQ(query.q || "");
+      if (qRaw) {
+        const digits = onlyDigits(qRaw);
+
+        // EMAIL
+        if (isProbablyEmail(qRaw)) {
+          const safe = escapeRegex(qRaw.toLowerCase());
+          filter.$or = [
+            { email: { $regex: safe, $options: "i" } },
+            { Email_pes: { $regex: safe, $options: "i" } },
+          ];
+        }
+        // NUMÉRICOS (cpf/cnpj/whats/código)
+        else if (digits.length >= 3) {
+          const cod = Number(digits);
+
+          const or: any[] = [
+            { cpfCnpj: digits },
+            { cpf_pes: digits },
+            { numeroWhatsapp: digits },
+          ];
+
+          if (!Number.isNaN(cod)) {
+            or.push({ codPes: cod });
+            or.push({ cod_pes: cod });
+          }
+
+          if (digits.length >= 6) {
+            const rx = escapeRegex(digits);
+            or.push({ cpfCnpj: { $regex: rx } });
+            or.push({ cpf_pes: { $regex: rx } });
+            or.push({ numeroWhatsapp: { $regex: rx } });
+          }
+
+          filter.$or = or;
+        }
+        // TEXTO (nome)
+        else {
+          if (qRaw.length >= 2) {
+            const safe = escapeRegex(qRaw);
+
+            // contains, case-insensitive
+            filter.$or = [
+              { nome: { $regex: safe, $options: "i" } },
+              { nome_pes: { $regex: safe, $options: "i" } },
+            ];
+          }
+        }
+      }
+
+
+      // sort seguro
+      const sortField = SORT_FIELDS[query.sortKey] ?? SORT_FIELDS.alteracao;
+      const sortDir = query.sortDir === "asc" ? 1 : -1;
+
+      // fallback para "atendimentos" sem agregação:
+      // - mantém DataAlt_pes (previsível e rápido)
+      const sort: any = {};
+      sort[sortField] = sortDir;
+
+      // Dica anti-delay: hint opcional (só se você tiver os índices)
+      // const hint = query.tab !== "todos" ? { Status_pes: 1, DataAlt_pes: -1 } : { DataAlt_pes: -1 };
+
+      const [total, items] = await Promise.all([
+        Cliente.countDocuments(filter),
+        Cliente.find(filter)
+          .sort(sort)
+          .skip(skip)
+          .limit(query.limit)
+          .lean(),
+      ]);
+
+      const ms = Date.now() - startedAt;
+
+      return ok(res, {
+        status: true,
+        message: "Clientes encontrados",
+        data: {
+          items,
+          total,
+          page: query.page,
+          limit: query.limit,
+          totalPages: Math.max(1, Math.ceil(total / query.limit)),
+          tookMs: ms, // útil pra você medir no front/back
+        },
+      });
+    } catch (error) {
+      return fail(res, error, "Erro ao listar clientes");
+    }
+  }
+
+  /**
+   * GET /api/cliente/:id
+   * (sem POST pra buscar id — evita overhead e fica padrão REST)
+   */
+  async buscarClienteId(req: Request, res: Response) {
+    Console({ type: "log", message: "GET /api/cliente/:id" });
+
+    try {
+      const id = String(req.params.id ?? "").trim();
+      if (!id) {
+        return ok(res, { status: false, message: "ID do cliente não informado.", data: null });
+      }
+
+      const cliente = await Cliente.findById(id).lean();
 
       if (!cliente) {
-        Console({ type: "error", message: "Cliente não encontrado." });
-        return {
-          status: false,
-          message: "Cliente não encontrado.",
-          data: null,
-        };
+        return ok(res, { status: false, message: "Cliente não encontrado.", data: null });
       }
 
-      Console({
-        type: "success",
-        message: "Cliente encontrado com sucesso!",
-      });
-
-      return {
+      return ok(res, {
         status: true,
-        message: "Cliente encontrado com sucesso!",
-        data: {
-          ...cliente,
-          _id: String(cliente._id),
-        },
-      };
+        message: "Cliente encontrado",
+        data: { ...cliente, _id: String(cliente._id) },
+      });
     } catch (error) {
-      Console({ type: "error", message: "Erro ao buscar cliente." });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar cliente.",
-        data: null,
-      };
+      return fail(res, error, "Erro ao buscar cliente por id");
     }
   }
 
-  async buscarPorCodErp(cod_pes: number) {
-    if (cod_pes === undefined || cod_pes === null) {
-      return {
-        status: false,
-        message: "cod_pes não fornecido.",
-        data: null,
-      };
-    }
+  /**
+   * GET /api/cliente/cod/:cod
+   * (sem POST, retorna 1 item com findOne)
+   */
+  async buscarClienteCodErp(req: Request, res: Response) {
+    Console({ type: "log", message: "GET /api/cliente/cod/:cod" });
 
     try {
-      Console({
-        type: "log",
-        message: `Buscando cliente por cod_pes ${cod_pes}...`,
-      });
+      const codStr = String(req.params.cod ?? "").trim();
+      const cod = Number(codStr);
 
-      const cliente = await Cliente.find({ cod_pes: Number(cod_pes) }).lean() as ClienteType
-      console.log(cliente)
-      if (!cliente) {
-        Console({ type: "error", message: "Cliente não encontrado." });
-        return {
-          status: false,
-          message: "Cliente não encontrado.",
-          data: null,
-        };
+      if (!codStr || Number.isNaN(cod)) {
+        return ok(res, { status: false, message: "cod_pes inválido.", data: null });
       }
 
-      Console({
-        type: "success",
-        message: "Cliente encontrado com sucesso!",
-      });
-
-      return {
-        status: true,
-        message: "Cliente encontrado com sucesso!",
-        data: {
-          ...cliente,
-          _id: String(cliente._id),
-        },
-      };
-    } catch (error) {
-      Console({ type: "error", message: "Erro ao buscar cliente." });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar cliente.",
-        data: null,
-      };
-    }
-  }
-
-  async buscarPorCpf(cpf: string) {
-    const doc = cpf?.trim();
-
-    if (!doc) {
-      return {
-        status: false,
-        message: "CPF não fornecido.",
-        data: null,
-      };
-    }
-
-    try {
-      Console({
-        type: "log",
-        message: `Buscando cliente por CPF ${doc}...`,
-      });
-
-      const cliente = await Cliente.findOne({ cpf_pes: doc }).lean();
+      const cliente = await Cliente.findOne({ cod_pes: cod }).lean();
 
       if (!cliente) {
-        Console({ type: "error", message: "Cliente não encontrado." });
-        return {
-          status: false,
-          message: "Cliente não encontrado.",
-          data: null,
-        };
+        return ok(res, { status: false, message: "Cliente não encontrado.", data: null });
       }
 
-      Console({
-        type: "success",
-        message: "Cliente encontrado com sucesso!",
-      });
-
-      return {
+      return ok(res, {
         status: true,
-        message: "Cliente encontrado com sucesso!",
-        data: {
-          ...cliente,
-          _id: String(cliente._id),
-        },
-      };
+        message: "Cliente encontrado",
+        data: { ...cliente, _id: String(cliente._id) },
+      });
     } catch (error) {
-      Console({ type: "error", message: "Erro ao buscar cliente por CPF." });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar cliente por CPF.",
-        data: null,
-      };
+      return fail(res, error, "Erro ao buscar cliente por cod_pes");
     }
   }
-
-  async buscarPorEmail(email: string) {
-    const mail = email?.trim().toLowerCase();
-
-    if (!mail) {
-      return {
-        status: false,
-        message: "Email não fornecido.",
-        data: null,
-      };
-    }
+  async vincularWhatsapp(req: Request, res: Response) {
+    Console({ type: "log", message: "POST /api/cliente/whatsapp/atualizar" });
 
     try {
-      Console({
-        type: "log",
-        message: `Buscando cliente por email ${mail}...`,
-      });
+      const { whatsapp, id } = req.body;
 
-      const cliente = await Cliente.findOne({ Email_pes: mail }).lean();
+      if (!whatsapp || !id) {
+        return ok(res, { status: false, message: "Dados inválidos.", data: null });
+      }
+
+      const cliente = await Cliente.findOne({ _id: id }).lean();
 
       if (!cliente) {
-        Console({ type: "error", message: "Cliente não encontrado." });
-        return {
-          status: false,
-          message: "Cliente não encontrado.",
-          data: null,
-        };
+        return ok(res, { status: false, message: "Cliente não encontrado.", data: null });
       }
 
-      Console({
-        type: "success",
-        message: "Cliente encontrado com sucesso!",
-      });
+      await Cliente.findOneAndUpdate({ _id: id }, { $set: { numeroWhatsapp: whatsapp } });
 
-      return {
+      return ok(res, {
         status: true,
-        message: "Cliente encontrado com sucesso!",
-        data: {
-          ...cliente,
-          _id: String(cliente._id),
-        },
-      };
-    } catch (error) {
-      Console({
-        type: "error",
-        message: "Erro ao buscar cliente por email.",
+        message: "Cliente atualizado",
+        data: { ...cliente, _id: String(cliente._id) },
       });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar cliente por email.",
-        data: null,
-      };
+    } catch (error) {
+      return fail(res, error, "Erro ao vincular whatsapp");
+
     }
   }
-
-  async buscarPorWhatsapp(numeroWhatsapp: string) {
-    const numero = numeroWhatsapp?.trim();
-
-    if (!numero) {
-      return {
-        status: false,
-        message: "Número de WhatsApp não fornecido.",
-        data: null,
-      };
-    }
-
-    try {
-      Console({
-        type: "log",
-        message: `Buscando cliente por WhatsApp ${numero}...`,
-      });
-
-      const cliente = await Cliente.findOne({ numeroWhatsapp: numero }).lean();
-
-      if (!cliente) {
-        Console({ type: "error", message: "Cliente não encontrado." });
-        return {
-          status: false,
-          message: "Cliente não encontrado.",
-          data: null,
-        };
-      }
-
-      Console({
-        type: "success",
-        message: "Cliente encontrado com sucesso!",
-      });
-
-      return {
-        status: true,
-        message: "Cliente encontrado com sucesso!",
-        data: {
-          ...cliente,
-          _id: String(cliente._id),
-        },
-      };
-    } catch (error) {
-      Console({
-        type: "error",
-        message: "Erro ao buscar cliente por WhatsApp.",
-      });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar cliente por WhatsApp.",
-        data: null,
-      };
-    }
-  }
-
-  async buscarPorNomeParcial(nome: string) {
-    const termo = nome?.trim();
-
-    if (!termo) {
-      return {
-        status: false,
-        message: "Nome não fornecido.",
-        data: null,
-      };
-    }
-
-    try {
-      Console({
-        type: "log",
-        message: `Buscando clientes por nome parcial "${termo}"...`,
-      });
-
-      const clientes = await Cliente.find({
-        nome_pes: { $regex: termo, $options: "i" },
-      }).lean();
-
-      if (!clientes.length) {
-        Console({
-          type: "warn",
-          message: "Nenhum cliente encontrado para o nome informado.",
-        });
-        return {
-          status: true,
-          message: "Nenhum cliente encontrado para o nome informado.",
-          data: [],
-        };
-      }
-
-      const data = clientes.map((cli) => ({
-        ...cli,
-        _id: String(cli._id),
-      }));
-
-      Console({
-        type: "success",
-        message: "Clientes encontrados com sucesso!",
-      });
-
-      return {
-        status: true,
-        message: "Clientes encontrados com sucesso!",
-        data,
-      };
-    } catch (error) {
-      Console({
-        type: "error",
-        message: "Erro ao buscar clientes por nome.",
-      });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar clientes por nome.",
-        data: null,
-      };
-    }
-  }
-
-  /* -------------------------------------------------------------------------- */
-  /*  LISTAGENS                                                                 */
-  /* -------------------------------------------------------------------------- */
-
-  async listarTodos() {
-    try {
-      Console({ type: "log", message: "Buscando todos os clientes..." });
-
-      const clientes = await Cliente.find().lean();
-
-      if (!clientes.length) {
-        Console({
-          type: "warn",
-          message: "Nenhum cliente encontrado.",
-        });
-        return {
-          status: true,
-          message: "Nenhum cliente encontrado.",
-          data: [],
-        };
-      }
-
-      const data = clientes.map((cli) => ({
-        ...cli,
-        _id: String(cli._id),
-      }));
-
-      Console({
-        type: "success",
-        message: "Clientes encontrados com sucesso!",
-      });
-
-      return {
-        status: true,
-        message: "Clientes encontrados com sucesso!",
-        data,
-      };
-    } catch (error) {
-      Console({ type: "error", message: "Erro ao buscar clientes." });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar clientes.",
-        data: null,
-      };
-    }
-  }
-
-  async listarAtivos() {
-    try {
-      Console({ type: "log", message: "Buscando clientes ativos..." });
-
-      // aqui assumimos AtInat_pes = 0 como ativo (ajustar se regra for outra)
-      const clientes = await Cliente.find({ AtInat_pes: 0 }).lean();
-
-      if (!clientes.length) {
-        Console({
-          type: "warn",
-          message: "Nenhum cliente ativo encontrado.",
-        });
-        return {
-          status: true,
-          message: "Nenhum cliente ativo encontrado.",
-          data: [],
-        };
-      }
-
-      const data = clientes.map((cli) => ({
-        ...cli,
-        _id: String(cli._id),
-      }));
-
-      Console({
-        type: "success",
-        message: "Clientes ativos encontrados com sucesso!",
-      });
-
-      return {
-        status: true,
-        message: "Clientes ativos encontrados com sucesso!",
-        data,
-      };
-    } catch (error) {
-      Console({
-        type: "error",
-        message: "Erro ao buscar clientes ativos.",
-      });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao buscar clientes ativos.",
-        data: null,
-      };
-    }
-  }
-
-  /* -------------------------------------------------------------------------- */
-  /*  ATUALIZAÇÕES PONTUAIS                                                    */
-  /* -------------------------------------------------------------------------- */
-
-  async atualizarNumeroWhatsapp(clienteId: string, numeroWhatsapp: string) {
-    if (!clienteId) {
-      return {
-        status: false,
-        message: "ID do cliente não fornecido.",
-        data: null,
-      };
-    }
-
-    const numero = numeroWhatsapp?.trim();
-
-    if (!numero) {
-      return {
-        status: false,
-        message: "Número de WhatsApp não fornecido.",
-        data: null,
-      };
-    }
-
-    try {
-      Console({
-        type: "log",
-        message: `Atualizando número de WhatsApp do cliente ${clienteId}...`,
-      });
-
-      const updated = await Cliente.findByIdAndUpdate(
-        clienteId,
-        { $set: { numeroWhatsapp: numero } },
-        { new: true }
-      ).lean();
-
-      if (!updated) {
-        Console({ type: "error", message: "Cliente não encontrado." });
-        return {
-          status: false,
-          message: "Cliente não encontrado.",
-          data: null,
-        };
-      }
-
-      Console({
-        type: "success",
-        message: "Número de WhatsApp atualizado com sucesso!",
-      });
-
-      return {
-        status: true,
-        message: "Número de WhatsApp atualizado com sucesso!",
-        data: { ...updated, _id: String(updated._id) },
-      };
-    } catch (error) {
-      Console({
-        type: "error",
-        message: "Erro ao atualizar número de WhatsApp.",
-      });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao atualizar número de WhatsApp.",
-        data: null,
-      };
-    }
-  }
-
-  async atualizarDadosBasicos(
-    clienteId: string,
-    payload: {
-      nome_pes?: string;
-      Email_pes?: string;
-      cpf_pes?: string;
-    }
-  ) {
-    if (!clienteId) {
-      return {
-        status: false,
-        message: "ID do cliente não fornecido.",
-        data: null,
-      };
-    }
-
-    const { nome_pes, Email_pes, cpf_pes } = payload || {};
-
-    if (!nome_pes && !Email_pes && !cpf_pes) {
-      return {
-        status: false,
-        message: "Nada para atualizar (nome, email ou CPF).",
-        data: null,
-      };
-    }
-
-    const update: any = {};
-    if (nome_pes !== undefined) update.nome_pes = nome_pes;
-    if (Email_pes !== undefined) update.Email_pes = Email_pes;
-    if (cpf_pes !== undefined) update.cpf_pes = cpf_pes;
-
-    try {
-      Console({
-        type: "log",
-        message: `Atualizando dados básicos do cliente ${clienteId}...`,
-      });
-
-      const updated = await Cliente.findByIdAndUpdate(
-        clienteId,
-        { $set: update },
-        { new: true }
-      ).lean();
-
-      if (!updated) {
-        Console({ type: "error", message: "Cliente não encontrado." });
-        return {
-          status: false,
-          message: "Cliente não encontrado.",
-          data: null,
-        };
-      }
-
-      Console({
-        type: "success",
-        message: "Dados básicos atualizados com sucesso!",
-      });
-
-      return {
-        status: true,
-        message: "Dados básicos atualizados com sucesso!",
-        data: { ...updated, _id: String(updated._id) },
-      };
-    } catch (error) {
-      Console({
-        type: "error",
-        message: "Erro ao atualizar dados básicos do cliente.",
-      });
-      ConsoleData({ type: "error", data: error });
-      return {
-        status: false,
-        message: "Erro ao atualizar dados básicos do cliente.",
-        data: null,
-      };
-    }
-  }
-
-  /* -------------------------------------------------------------------------- */
-  /*  RELAÇÃO COM ATENDIMENTOS                                                 */
-  /* -------------------------------------------------------------------------- */
-
-  /*  async registrarAtendimento(clienteId: string, atendimentoId: string) {
-     if (!clienteId) {
-       return {
-         status: false,
-         message: "ID do cliente não fornecido.",
-         data: null,
-       };
-     }
-
-     const atd = atendimentoId?.trim();
-
-     if (!atd) {
-       return {
-         status: false,
-         message: "ID do atendimento não fornecido.",
-         data: null,
-       };
-     }
-
-     try {
-       Console({
-         type: "log",
-         message: `Registrando atendimento ${atd} para cliente ${clienteId}...`,
-       });
-
-       const updated = await Cliente.findByIdAndUpdate(
-         clienteId,
-         { $addToSet: { atendimentos: atd } },
-         { new: true }
-       ).lean();
-
-       if (!updated) {
-         Console({ type: "error", message: "Cliente não encontrado." });
-         return {
-           status: false,
-           message: "Cliente não encontrado.",
-           data: null,
-         };
-       }
-
-       Console({
-         type: "success",
-         message: "Atendimento registrado com sucesso!",
-       });
-
-       return {
-         status: true,
-         message: "Atendimento registrado com sucesso!",
-         data: { ...updated, _id: String(updated._id) },
-       };
-     } catch (error) {
-       Console({
-         type: "error",
-         message: "Erro ao registrar atendimento.",
-       });
-       ConsoleData({ type: "error", data: error });
-       return {
-         status: false,
-         message: "Erro ao registrar atendimento.",
-         data: null,
-       };
-     }
-   }
-
-   async listarAtendimentos(clienteId: string) {
-     if (!clienteId) {
-       return {
-         status: false,
-         message: "ID do cliente não fornecido.",
-         data: null,
-       };
-     }
-
-     try {
-       Console({
-         type: "log",
-         message: `Listando atendimentos do cliente ${clienteId}...`,
-       });
-
-       const cliente = await Cliente.findById(clienteId, {
-         atendimentos: 1,
-       }).lean();
-
-       if (!cliente) {
-         Console({ type: "error", message: "Cliente não encontrado." });
-         return {
-           status: false,
-           message: "Cliente não encontrado.",
-           data: null,
-         };
-       }
-
-       const atendimentos = cliente.atendimentos ?? [];
-
-       Console({
-         type: "success",
-         message: "Atendimentos listados com sucesso!",
-       });
-
-       return {
-         status: true,
-         message: "Atendimentos listados com sucesso!",
-         data: atendimentos,
-       };
-     } catch (error) {
-       Console({
-         type: "error",
-         message: "Erro ao listar atendimentos do cliente.",
-       });
-       ConsoleData({ type: "error", data: error });
-       return {
-         status: false,
-         message: "Erro ao listar atendimentos do cliente.",
-         data: null,
-       };
-     }
-   } */
 }

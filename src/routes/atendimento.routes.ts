@@ -1,5 +1,5 @@
 // src/routes/atendimento.routes.ts
-import { Router } from "express";
+import { Request, Response, Router } from "express";
 import Console, { ConsoleData } from "../lib/Console";
 
 import AtendimentoController, {
@@ -65,6 +65,49 @@ function toSortBy(v: any): "updatedAt" | "createdAt" | "dataAtualizacao" | undef
 /* -------------------------------------------------------------------------- */
 /*  ROTAS                                                                     */
 /* -------------------------------------------------------------------------- */
+
+
+
+
+
+router.get("/atendimentos-ativos", (req, res) => controller.buscarAtivos({ req, res }));
+router.post("/atendimentos-ativos-atendente", (req, res) => controller.buscarAtivosAtendente({ req, res }));
+router.post("/atendimentos-por-status", (req, res) => controller.buscarPorStatus({ req, res }));
+router.post("/atendimentos-por-fila", (req, res) => controller.buscarPorFila({ req, res }));
+router.get("/metricas-atuais", (req, res) => controller.buscarMetricasAtuais({ req, res }));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /**
  * GET /api/atendimentos/health
@@ -412,6 +455,10 @@ router.post("/:id/reabrir", async (req, res) => {
     return err(res, error, "Erro ao reabrir atendimento");
   }
 });
+
+
+
+
 
 const atendimentoRoutes = router;
 export default atendimentoRoutes;

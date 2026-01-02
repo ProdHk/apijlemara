@@ -9,7 +9,7 @@ import Atendimento, {
   ResultadoContato,
   HistoricoType,
 } from "../models/Atendimento";
-
+import type { Request, Response } from "express";
 type SortBy = "updatedAt" | "createdAt" | "dataAtualizacao";
 type SortDir = "asc" | "desc";
 
@@ -58,6 +58,35 @@ type AttachMessageMeta = {
   actor?: string; // "system" | userId | nome
 };
 
+/*
+
+
+
+
+*/
+
+
+type ResponseType = {
+  status: boolean
+  message: string;
+  data: any;
+}
+
+export type MetricasAtuaisDTO = {
+  total: number;
+  totalAtivos: number;
+
+  porStatus: Record<AtendimentoStatus, number>;
+  porTipo: Record<AtendimentoTipo, number>;
+  porResultadoContato: Partial<Record<ResultadoContato, number>>;
+
+  semAtendenteAtivos: number;
+  atrasados24h: number; // ativos sem atualização há 24h
+
+  ultimos7dias: { dia: string; total: number }[]; // YYYY-MM-DD
+};
+
+
 function toPublic(doc: any) {
   return doc ? { ...doc, _id: String(doc._id) } : doc;
 }
@@ -79,6 +108,22 @@ function safeRegex(q: string) {
 function buildHistory(title: string, content: string, user = "system"): HistoricoType {
   return { title, content, user, date: now() };
 }
+
+
+
+
+function ok(res: any, data: any) {
+  return res.status(200).json(data);
+}
+
+function fail(res: any, error: unknown, fallback = "Erro interno") {
+  const message = error instanceof Error ? error.message : fallback;
+  Console({ type: "error", message });
+  ConsoleData({ type: "error", data: error });
+  return res.status(500).json({ status: false, message, data: null });
+}
+
+
 
 /**
  * Estratégia anti-duplicidade:
@@ -537,6 +582,204 @@ export default class AtendimentoController {
 
     return { atendimento, metricas };
   }
+
+
+
+
+
+
+
+
+
+
+
+
+  async buscarAtivos({ req, res }: { req: Request, res: Response }) {
+
+    Console({ type: "log", message: "GET /api/atendimento/atendimentos-ativos" });
+
+    let response: ResponseType
+    try {
+      const result = await Atendimento.find({ status: { $in: ATIVOS } }).lean();
+      response = {
+        status: true,
+        message: "Atendimentos ativos encontrados",
+        data: result
+      }
+      return ok(res, response)
+    } catch (error) {
+      return fail(res, error, "Erro ao buscar atendimentos ativos")
+    }
+  }
+
+
+
+  async buscarAtivosAtendente({ req, res }: { req: Request, res: Response }) {
+
+    Console({ type: "log", message: "GET /api/atendimento/atendimentos-ativos-atendente" });
+
+    let response: ResponseType
+    try {
+
+      const { atendente } = req.body
+
+      const result = await Atendimento.find({ status: { $in: ATIVOS }, $and: [{ atendente }] }).lean();
+
+      response = {
+        status: true,
+        message: "Atendimentos ativos encontrados",
+        data: result
+      }
+      return ok(res, response)
+    } catch (error) {
+      return fail(res, error, "Erro ao buscar atendimentos ativos")
+    }
+  }
+  async buscarPorStatus({ req, res }: { req: Request, res: Response }) {
+
+    Console({ type: "log", message: "GET /api/atendimento/atendimentos-por-status" });
+
+    let response: ResponseType
+    try {
+
+      const { status } = req.body
+      const result = await Atendimento.find({ status }).lean();
+
+      response = {
+        status: true,
+        message: "Atendimentos ativos encontrados",
+        data: result
+      }
+
+      return ok(res, response)
+    } catch (error) {
+      return fail(res, error, "Erro ao buscar atendimentos ativos")
+    }
+  }
+  async buscarPorFila({ req, res }: { req: Request, res: Response }) {
+
+    Console({ type: "log", message: "GET /api/atendimento/atendimentos-por-fila" });
+
+    let response: ResponseType
+    const { fila } = req.body
+
+    try {
+
+      const result = await Atendimento.find({ tipo: fila }).lean();
+
+      response = {
+        status: true,
+        message: "Atendimentos da fila " + fila + "  encontrados",
+        data: result
+      }
+
+      return ok(res, response)
+    } catch (error) {
+      return fail(res, error, "Erro ao buscar atendimentos da fila " + fila)
+    }
+  }
+  async buscarMetricasAtuais({ req, res }: { req: Request; res: Response }) {
+    Console({ type: "log", message: "GET /api/atendimento/metricas-atuais" });
+
+    try {
+      const now = new Date();
+      const d24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      const d7 = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+      const [agg] = await Atendimento.aggregate([
+        {
+          $facet: {
+            total: [{ $count: "v" }],
+            totalAtivos: [
+              { $match: { status: { $in: ATIVOS } } },
+              { $count: "v" },
+            ],
+
+            porStatus: [
+              { $group: { _id: "$status", v: { $sum: 1 } } },
+            ],
+
+            porTipo: [
+              { $group: { _id: "$tipo", v: { $sum: 1 } } },
+            ],
+
+            porResultadoContato: [
+              { $match: { resultadoContato: { $ne: null } } },
+              { $group: { _id: "$resultadoContato", v: { $sum: 1 } } },
+            ],
+
+            semAtendenteAtivos: [
+              {
+                $match: {
+                  status: { $in: ATIVOS },
+                  $or: [{ atendente: null }, { atendente: { $exists: false } }],
+                },
+              },
+              { $count: "v" },
+            ],
+
+            atrasados24h: [
+              { $match: { status: { $in: ATIVOS }, dataAtualizacao: { $lte: d24h } } },
+              { $count: "v" },
+            ],
+
+            ultimos7dias: [
+              { $match: { createdAt: { $gte: d7 } } },
+              {
+                $group: {
+                  _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                  total: { $sum: 1 },
+                },
+              },
+              { $sort: { _id: 1 } },
+              { $project: { _id: 0, dia: "$_id", total: 1 } },
+            ],
+          },
+        },
+      ]);
+
+      const toRecord = (arr: any[]) =>
+        (arr || []).reduce((acc, it) => {
+          acc[it._id] = it.v;
+          return acc;
+        }, {} as Record<string, number>);
+
+      const data: MetricasAtuaisDTO = {
+        total: agg?.total?.[0]?.v ?? 0,
+        totalAtivos: agg?.totalAtivos?.[0]?.v ?? 0,
+
+        porStatus: toRecord(agg?.porStatus) as any,
+        porTipo: toRecord(agg?.porTipo) as any,
+        porResultadoContato: toRecord(agg?.porResultadoContato) as any,
+
+        semAtendenteAtivos: agg?.semAtendenteAtivos?.[0]?.v ?? 0,
+        atrasados24h: agg?.atrasados24h?.[0]?.v ?? 0,
+
+        ultimos7dias: agg?.ultimos7dias ?? [],
+      };
+
+      return ok(res, { status: true, message: "Métricas atuais carregadas", data });
+    } catch (error) {
+      return fail(res, error, "Erro ao buscar métricas atuais");
+    }
+  }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
 
 // =========================
