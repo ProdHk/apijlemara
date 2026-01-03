@@ -1,7 +1,8 @@
 // controllers/ClienteController.ts
 import { Request, Response } from "express";
 import Console, { ConsoleData } from "../lib/Console";
-import Cliente, { ClienteType } from "../models/Cliente";
+import Cliente, { ClienteType, TelefoneClienteType } from "../models/Cliente";
+import { PessoaUauRequest } from '../types/uauTypes'
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -104,43 +105,7 @@ export default class ClienteController {
   /* ERP / CADASTRO BÁSICO                                                     */
   /* -------------------------------------------------------------------------- */
 
-  async cadastrar(payload: any) {
-    if (!payload) {
-      Console({ type: "error", message: "Payload vazio." });
-      return { status: false, message: "Payload vazio.", data: null };
-    }
 
-    const cod = payload.cod_pes;
-
-    if (cod === undefined || cod === null) {
-      Console({ type: "error", message: "Código (cod_pes) do cliente é obrigatório." });
-      return { status: false, message: "Código (cod_pes) do cliente é obrigatório.", data: null };
-    }
-
-    try {
-      Console({ type: "log", message: `Cadastrando/atualizando cliente ${cod}...` });
-
-      const cliente = await Cliente.findOneAndUpdate(
-        { cod_pes: cod },
-        { $set: payload },
-        { upsert: true, new: true }
-      ).lean();
-
-      if (!cliente) {
-        return { status: false, message: "Erro ao cadastrar cliente.", data: null };
-      }
-
-      return {
-        status: true,
-        message: "Cliente cadastrado com sucesso!",
-        data: { ...cliente, _id: String(cliente._id) } as ClienteType,
-      };
-    } catch (error) {
-      Console({ type: "error", message: "Erro ao cadastrar cliente." });
-      ConsoleData({ type: "error", data: error });
-      return { status: false, message: "Erro ao cadastrar cliente.", data: null };
-    }
-  }
 
   async sincronizarErp(payload: any) {
     if (!payload) {
@@ -165,53 +130,6 @@ export default class ClienteController {
     }
   }
 
-  async sincronizarListaErp(payload: any[]) {
-    if (!payload || !payload.length) {
-      Console({ type: "error", message: "Payload vazio." });
-      return { status: false, message: "Payload vazio.", data: null };
-    }
-
-    try {
-      const total = payload.length;
-      let success = 0;
-      let failCount = 0;
-
-      Console({ type: "log", message: `Sincronizando lista de clientes (${total})...` });
-
-      for (const cli of payload) {
-        const cod = cli?.cod_pes;
-
-        if (cod === undefined || cod === null) {
-          Console({ type: "warn", message: "cod_pes vazio, ignorando registro." });
-          failCount++;
-          continue;
-        }
-
-        try {
-          const result = await this.cadastrar({ ...cli, cod_pes: cod });
-          if (!result.status) {
-            failCount++;
-            Console({ type: "warn", message: `Falha ao sincronizar cliente ${cod}: ${result.message}` });
-            continue;
-          }
-          success++;
-        } catch (err) {
-          failCount++;
-          Console({ type: "error", message: `Erro ao sincronizar cliente ${cod}.` });
-          ConsoleData({ type: "error", data: err });
-        }
-      }
-
-      const message = `Total de clientes sincronizados: ${success} de ${total}, ${failCount} falhas.`;
-      Console({ type: "success", message });
-
-      return { status: true, message, data: { total, success, fail: failCount } };
-    } catch (error) {
-      Console({ type: "error", message: "Erro ao sincronizar clientes." });
-      ConsoleData({ type: "error", data: error });
-      return { status: false, message: "Erro ao sincronizar clientes.", data: null };
-    }
-  }
 
   /* -------------------------------------------------------------------------- */
   /* BUSCAS (HTTP)                                                             */
@@ -461,4 +379,160 @@ export default class ClienteController {
 
     }
   }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  /* REFATORADO */
+
+
+  async cadastrar(payload: ClienteType) {
+
+    if (!payload) {
+      Console({ type: "error", message: "Payload vazio." });
+      return { status: false, message: "Payload vazio.", data: null };
+    }
+
+    const cod = payload.codPes;
+
+    if (cod === undefined || cod === null) {
+      Console({ type: "error", message: "Código (cod_pes) do cliente é obrigatório." });
+      return { status: false, message: "Código (cod_pes) do cliente é obrigatório.", data: null };
+    }
+
+    try {
+      Console({ type: "log", message: `Cadastrando/atualizando cliente ${cod}...` });
+
+      const cliente = await Cliente.findOneAndUpdate(
+        { codPes: cod },
+        { $set: payload },
+        { upsert: true, new: true }
+      ).lean();
+
+      if (!cliente) {
+        return { status: false, message: "Erro ao cadastrar cliente.", data: null };
+      }
+
+      return {
+        status: true,
+        message: "Cliente cadastrado com sucesso!",
+        data: { ...cliente, _id: String(cliente._id) } as ClienteType,
+      };
+    } catch (error) {
+      Console({ type: "error", message: "Erro ao cadastrar cliente." });
+      ConsoleData({ type: "error", data: error });
+      return { status: false, message: "Erro ao cadastrar cliente.", data: null };
+    }
+  }
+
+  async cadastrarTelefonesEmMassa(payload: any) {
+    Console({ type: "log", message: "Cadastrando telefones em massa..." });
+
+    try {
+      let total = payload.length, success = 0, fail = 0;
+
+      for (const item of payload) {
+        await Cliente.findOneAndUpdate({ codPes: item.codPes }, { $addToSet: { telefones: item.telefones } }).catch(() => {
+          fail++;
+        })
+
+        success++;
+
+      }
+    } catch (error) {
+
+    }
+  }
+
+
+  async sincronizarListaErp(payload: PessoaUauRequest[]) {
+
+    if (!payload || !payload.length) {
+      Console({ type: "error", message: "Payload vazio." });
+      return { status: false, message: "Payload vazio.", data: null };
+    }
+
+    try {
+      const total = payload.length;
+      let success = 0;
+      let failCount = 0;
+
+      Console({ type: "log", message: `Sincronizando lista de clientes (${total})...` });
+
+      for (const cli of payload as PessoaUauRequest[]) {
+        const codPes = Number(cli?.CodigoPessoa);
+
+        if (codPes === undefined || codPes === null) {
+          Console({ type: "warn", message: "cod_pes vazio, ignorando registro." });
+          failCount++;
+          continue;
+        }
+
+        try {
+
+          const buffer: ClienteType = {
+            codPes: cli.CodigoPessoa,
+            nome: cli.NomePessoa,
+            tipo: cli.TipoPessoa,
+            cpfCnpj: cli.CpfPessoa,
+            dataNascimento: new Date(String(cli.DataNascimentoPessoa)),
+            dataCadastro: new Date(String(cli.DataCadastroPessoa)),
+            status: cli.StatusPessoa,
+            email: cli.EmailPessoa,
+            dataAlteracao: new Date(String(cli.DataAlteracaoPessoa)),
+            nomeFantasia: cli.NomeFantasia,
+            anexos: cli.AnexosPessoa,
+            login: cli.LoginPessoa,
+            senha: cli.SenhaLoginPessoa,
+          }
+
+          const result = await this.cadastrar(buffer);
+
+
+          if (!result.status) {
+            failCount++;
+            Console({ type: "warn", message: `Falha ao sincronizar cliente ${cli.CodigoPessoa}: ${result.message}` });
+            continue;
+          }
+          success++;
+        } catch (err) {
+          failCount++;
+          Console({ type: "error", message: `Erro ao sincronizar cliente ${cli.CodigoPessoa}.` });
+          ConsoleData({ type: "error", data: err });
+        }
+      }
+
+      const message = `Total de clientes sincronizados: ${success} de ${total}, ${failCount} falhas.`;
+
+      Console({ type: "success", message });
+
+      return { status: true, message, data: { total, success, fail: failCount } };
+    } catch (error) {
+      Console({ type: "error", message: "Erro ao sincronizar clientes." });
+      ConsoleData({ type: "error", data: error });
+      return { status: false, message: "Erro ao sincronizar clientes.", data: null };
+    }
+  }
+
 }
