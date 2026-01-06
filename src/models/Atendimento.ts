@@ -60,6 +60,14 @@ export interface AtendimentoType {
 
   // resultado de contato
   resultadoContato?: ResultadoContato | null;
+
+  waId?: string
+
+  /** ✅ número canonical (E.164 sem símbolos, BR sempre com 9 dígitos quando aplicável) */
+  numeroWhatsappCanon?: string
+
+  /** ✅ guarda variações já vistas (sem/ com 9, etc) */
+  numeroWhatsappAliases: string[]
 }
 
 const AtendimentoSchema = new Schema<AtendimentoType>(
@@ -131,11 +139,24 @@ const AtendimentoSchema = new Schema<AtendimentoType>(
       default: null,
       index: true,
     },
+
+    waId: { type: String, index: true },
+
+    /** ✅ número canonical (E.164 sem símbolos, BR sempre com 9 dígitos quando aplicável) */
+    numeroWhatsappCanon: { type: String, index: true },
+
+    /** ✅ guarda variações já vistas (sem/ com 9, etc) */
+    numeroWhatsappAliases: { type: [String], default: [] },
   },
   {
     timestamps: true, // createdAt / updatedAt
     minimize: false,
   }
+);
+
+AtendimentoSchema.index(
+  { waId: 1 },
+  { unique: true, partialFilterExpression: { waId: { $type: "string" } } }
 );
 
 const Atendimento =

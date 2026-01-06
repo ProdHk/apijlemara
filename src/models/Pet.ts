@@ -15,10 +15,23 @@ export const PET_TIPO = ["ideia", "melhoria", "resumo", "curso", "erro-interno"]
 export type PetStatus = (typeof PET_STATUS)[number];
 export type PetTipo = (typeof PET_TIPO)[number];
 
+
+export type PetHistorico = {
+  data: Date,
+  interacao: string,
+  descricao: string
+}
 export type PetImplantacao = {
   apto: boolean;
   concluido: boolean;
   responsaveis: string[]; // <- era tuple [string], isso quebra pra listas
+  publico: boolean;
+
+  historico: [{
+    data: Date,
+    interacao: string,
+    descricao: string
+  }]
 };
 
 export type PetAnexoTipo = "documento" | "interacao";
@@ -51,16 +64,31 @@ export interface PetType {
 }
 
 /** ====== Schemas (Mongoose) ====== */
+const PetHistoricoSchema = new Schema<PetHistorico>(
+  {
+    data: { type: Date, default: Date.now() },
+    descricao: { type: String, required: true },
+    interacao: { type: String, required: true },
+  },
+  {
+    _id: false,
+    id: false,
+  }
+);
+
 const PetImplantacaoSchema = new Schema<PetImplantacao>(
   {
     apto: { type: Boolean, default: false },
     concluido: { type: Boolean, default: false },
     responsaveis: { type: [String], default: [] },
+    publico: { type: Boolean, required: true, default: false },
+
+    historico: { type: [PetHistoricoSchema], default: [] },
+
   },
   {
     _id: false,
     id: false,
-    // timestamps aqui geralmente não faz sentido pra subdocumento embutido
   }
 );
 

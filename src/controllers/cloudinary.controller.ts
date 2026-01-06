@@ -1,20 +1,29 @@
-// src/controllers/cloudinary.controller.ts
-
 import { v2 as cloudinary, UploadApiResponse } from "cloudinary";
 import { configDotenv } from "dotenv";
+import fs from "fs";
 import Console from "../lib/Console";
 
 configDotenv();
 
+/* -------------------------------------------------------------------------- */
+/* Types                                                                      */
+/* -------------------------------------------------------------------------- */
+
+export type CloudinaryResourceType = "image" | "video" | "raw";
+
 export type CloudinaryUploadResult = {
-  public_id: string;        // <-- ID da mídia pra salvar no DB
-  secure_url: string;       // URL pública https
-  url?: string;       // URL pública https
-  resource_type: "image" | "video" | "raw";
+  public_id: string;
+  secure_url: string;
+  url?: string;
+  resource_type: CloudinaryResourceType;
   format?: string;
   bytes?: number;
   original_filename?: string;
 };
+
+/* -------------------------------------------------------------------------- */
+/* Controller                                                                 */
+/* -------------------------------------------------------------------------- */
 
 export default class CloudinaryController {
   private static initialized = false;
@@ -30,7 +39,6 @@ export default class CloudinaryController {
       );
     }
 
-    // configura só uma vez (mesmo que instancie o controller várias vezes)
     if (!CloudinaryController.initialized) {
       cloudinary.config({
         cloud_name: this.cloud_name,
@@ -41,12 +49,43 @@ export default class CloudinaryController {
     }
   }
 
+  /* ------------------------------------------------------------------------ */
+  /* Helpers                                                                  */
+  /* ------------------------------------------------------------------------ */
+
+  private normalizeResult(res: UploadApiResponse): CloudinaryUploadResult {
+    return {
+      public_id: res.public_id,
+      secure_url: res.secure_url,
+      resource_type: res.resource_type as CloudinaryResourceType,
+      format: res.format,
+      bytes: res.bytes,
+      original_filename: res.original_filename,
+    };
+  }
+
+  private safeUnlink(path?: string) {
+    if (!path) return;
+    try {
+      if (fs.existsSync(path)) fs.unlinkSync(path);
+    } catch {
+      // silêncio proposital
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Uploads                                                                  */
+  /* ------------------------------------------------------------------------ */
+
   /**
-   * Upload público (sempre).
-   * Retorna o public_id (ID pra salvar no DB) + secure_url e metadados úteis.
+   * Upload via caminho do arquivo NO SERVIDOR
+   * (uso interno / jobs / WhatsApp / automações)
    */
-  async uploadFile(filePath: string, folder?: string): Promise<CloudinaryUploadResult | null> {
-    Console({ type: "log", message: "Enviando arquivo para Cloudinary..." });
+  async uploadFile(
+    filePath: string,
+    folder?: string
+  ): Promise<CloudinaryUploadResult | null> {
+    Console({ type: "log", message: "Cloudinary upload (filePath)" });
 
     try {
       const res = (await cloudinary.uploader.upload(filePath, {
@@ -55,63 +94,87 @@ export default class CloudinaryController {
         access_mode: "public",
       })) as UploadApiResponse;
 
-      Console({ type: "success", message: "Arquivo enviado para Cloudinary com sucesso." });
-
-      return {
-        public_id: res.public_id,
-        secure_url: res.secure_url,
-        resource_type: res.resource_type as "image" | "video" | "raw",
-        format: res.format,
-        bytes: res.bytes,
-        original_filename: res.original_filename,
-      } as CloudinaryUploadResult;
+      Console({ type: "success", message: "Upload realizado com sucesso." });
+      return this.normalizeResult(res);
     } catch (error) {
       Console({
         type: "error",
-        message: `Erro ao enviar arquivo para Cloudinary: ${(error as Error).message}`,
+        message: `Cloudinary upload error: ${(error as Error).message}`,
       });
       return null;
     }
   }
 
   /**
-   * Busca detalhes do recurso (quando precisar).
-   * Observação: pra pegar URL, você normalmente já tem secure_url no retorno do upload.
+   * ✅ NOVO
+   * Upload via multipart (multer)
+   * Usado pelo front-end
    */
+  async uploadMultipart(
+    file: Express.Multer.File,
+    folder?: string
+  ): Promise<CloudinaryUploadResult | null> {
+    Console({ type: "log", message: "Cloudinary upload (multipart)" });
+
+    if (!file?.path) {
+      Console({ type: "error", message: "Arquivo multipart inválido." });
+      return null;
+    }
+
+    try {
+      const res = (await cloudinary.uploader.upload(file.path, {
+        resource_type: "auto",
+        folder,
+        access_mode: "public",
+      })) as UploadApiResponse;
+
+      Console({ type: "success", message: "Upload multipart realizado." });
+
+      return this.normalizeResult(res);
+    } catch (error) {
+      Console({
+        type: "error",
+        message: `Erro upload multipart: ${(error as Error).message}`,
+      });
+      return null;
+    } finally {
+      // limpa arquivo temporário SEMPRE
+      this.safeUnlink(file.path);
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Resource / Delete                                                        */
+  /* ------------------------------------------------------------------------ */
+
   async getResource(public_id: string): Promise<UploadApiResponse | null> {
-    Console({ type: "log", message: "Buscando recurso na Cloudinary..." });
+    Console({ type: "log", message: "Buscando recurso Cloudinary" });
 
     try {
       const res = (await cloudinary.api.resource(public_id)) as UploadApiResponse;
-      Console({ type: "success", message: "Recurso buscado com sucesso." });
       return res;
     } catch (error) {
       Console({
         type: "error",
-        message: `Erro ao buscar recurso na Cloudinary: ${(error as Error).message}`,
+        message: `Erro ao buscar recurso: ${(error as Error).message}`,
       });
       return null;
     }
   }
 
-  /**
-   * Deleta arquivo.
-   * Dica: se você salvar resource_type no DB junto do public_id, delete fica 100% garantido.
-   */
   async deleteFile(
     public_id: string,
-    resource_type: "image" | "video" | "raw" = "image"
+    resource_type: CloudinaryResourceType = "image"
   ): Promise<{ result: string } | null> {
-    Console({ type: "log", message: "Deletando arquivo na Cloudinary..." });
+    Console({ type: "log", message: "Deletando recurso Cloudinary" });
 
     try {
       const res = await cloudinary.uploader.destroy(public_id, { resource_type });
-      Console({ type: "success", message: "Arquivo deletado com sucesso." });
       return res as { result: string };
     } catch (error) {
       Console({
         type: "error",
-        message: `Erro ao deletar arquivo na Cloudinary: ${(error as Error).message}`,
+        message: `Erro ao deletar recurso: ${(error as Error).message}`,
       });
       return null;
     }

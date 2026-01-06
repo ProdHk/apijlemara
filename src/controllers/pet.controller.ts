@@ -1,6 +1,6 @@
 // src/controllers/pet.controller.ts
 import { Request, Response } from "express";
-import Pet, { PetAnexo, PetType } from "models/Pet";
+import Pet, { PetAnexo, PetType } from "../models/Pet";
 import Console, { ConsoleData } from "../lib/Console";
 import usuarioController from "./usuario.controller";
 

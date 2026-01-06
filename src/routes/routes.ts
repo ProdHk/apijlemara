@@ -11,6 +11,7 @@ import cloudinaryRoutes from "./cloudinary.routes";
 
 import atendimentoRoutes from "./atendimento.routes";
 import petRoutes from "./pet.routes";
+import metaRoutes from "./meta.routes";
 
 const routes = Router();
 
@@ -31,5 +32,9 @@ routes.use("/atendimento", atendimentoRoutes);
 
 // core programa de excelencia no trbalho
 routes.use("/pet", petRoutes);
+
+
+// meta
+routes.use("/meta", metaRoutes);
 
 export default routes;
