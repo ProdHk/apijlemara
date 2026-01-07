@@ -168,7 +168,7 @@ router.post("/upload", async (req, res) => {
 
   try {
     const filePath = pickString(req.body?.filePath);
-    const folder = pickString(req.body?.folder) || undefined;
+    const folder = pickString(req.body?.folder) || 'undefined';
 
     if (!filePath) {
       return ok(

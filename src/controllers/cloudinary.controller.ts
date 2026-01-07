@@ -1,14 +1,26 @@
+// src/controllers/cloudinary.controller.ts
 import { v2 as cloudinary, UploadApiResponse } from "cloudinary";
 import { configDotenv } from "dotenv";
 import fs from "fs";
+import os from "os";
+import path from "path";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import Console from "../lib/Console";
 
 configDotenv();
 
+const execFileAsync = promisify(execFile);
+
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
 /* -------------------------------------------------------------------------- */
-
+export type CloudinaryUploadOptions = {
+  resource_type?: "image" | "video" | "raw" | "auto";
+  folder?: string;
+  public_id?: string;
+  overwrite?: boolean;
+};
 export type CloudinaryResourceType = "image" | "video" | "raw";
 
 export type CloudinaryUploadResult = {
@@ -64,34 +76,77 @@ export default class CloudinaryController {
     };
   }
 
-  private safeUnlink(path?: string) {
-    if (!path) return;
+  private safeUnlink(p?: string) {
+    if (!p) return;
     try {
-      if (fs.existsSync(path)) fs.unlinkSync(path);
+      if (fs.existsSync(p)) fs.unlinkSync(p);
     } catch {
       // silêncio proposital
     }
+  }
+
+  private tmpFile(ext: string) {
+    const name = `voice_${Date.now()}_${Math.random().toString(16).slice(2)}.${ext}`;
+    return path.join(os.tmpdir(), name);
+  }
+
+  private async ffprobeAudioInfo(filePath: string): Promise<{
+    formatName: string;
+    codecName: string;
+  }> {
+    // ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -show_entries format=format_name -of json input
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v",
+      "error",
+      "-select_streams",
+      "a:0",
+      "-show_entries",
+      "stream=codec_name",
+      "-show_entries",
+      "format=format_name",
+      "-of",
+      "json",
+      filePath,
+    ]);
+
+    const json = JSON.parse(stdout || "{}");
+    const formatName = String(json?.format?.format_name || "").toLowerCase(); // ex: "ogg"
+    const codecName = String(json?.streams?.[0]?.codec_name || "").toLowerCase(); // ex: "opus"
+    return { formatName, codecName };
+  }
+
+  private async convertToOggOpus(inputPath: string, outputPath: string) {
+    // WhatsApp-like: mono, 48k
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-i",
+      inputPath,
+      "-vn",
+      "-c:a",
+      "libopus",
+      "-ar",
+      "48000",
+      "-ac",
+      "1",
+      outputPath,
+    ]);
   }
 
   /* ------------------------------------------------------------------------ */
   /* Uploads                                                                  */
   /* ------------------------------------------------------------------------ */
 
-  /**
-   * Upload via caminho do arquivo NO SERVIDOR
-   * (uso interno / jobs / WhatsApp / automações)
-   */
-  async uploadFile(
-    filePath: string,
-    folder?: string
-  ): Promise<CloudinaryUploadResult | null> {
+  async uploadFile(filePath: string, folder: string, opts?: CloudinaryUploadOptions) {
     Console({ type: "log", message: "Cloudinary upload (filePath)" });
 
     try {
+      const resourceType = opts?.resource_type ?? "auto";
+
       const res = (await cloudinary.uploader.upload(filePath, {
-        resource_type: "auto",
         folder,
-        access_mode: "public",
+        resource_type: resourceType,
+        overwrite: opts?.overwrite ?? true,
+        ...(opts?.public_id ? { public_id: opts.public_id } : {}),
       })) as UploadApiResponse;
 
       Console({ type: "success", message: "Upload realizado com sucesso." });
@@ -105,15 +160,7 @@ export default class CloudinaryController {
     }
   }
 
-  /**
-   * ✅ NOVO
-   * Upload via multipart (multer)
-   * Usado pelo front-end
-   */
-  async uploadMultipart(
-    file: Express.Multer.File,
-    folder?: string
-  ): Promise<CloudinaryUploadResult | null> {
+  async uploadMultipart(file: Express.Multer.File, folder?: string): Promise<CloudinaryUploadResult | null> {
     Console({ type: "log", message: "Cloudinary upload (multipart)" });
 
     if (!file?.path) {
@@ -129,7 +176,6 @@ export default class CloudinaryController {
       })) as UploadApiResponse;
 
       Console({ type: "success", message: "Upload multipart realizado." });
-
       return this.normalizeResult(res);
     } catch (error) {
       Console({
@@ -138,8 +184,91 @@ export default class CloudinaryController {
       });
       return null;
     } finally {
-      // limpa arquivo temporário SEMPRE
       this.safeUnlink(file.path);
+    }
+  }
+
+  /**
+   * ✅ NOVÍSSIMO (voice note only)
+   * Faz upload GARANTINDO OGG/OPUS.
+   * - Se input não for ogg/opus => converte com ffmpeg.
+   * - Upload no Cloudinary usando resource_type "video" (padrão Cloudinary p/ áudio),
+   *   e força format "ogg" para URL terminar em .ogg.
+   */
+  async uploadVoiceNoteOggOpus(
+    filePath: string,
+    folder: string,
+    opts?: { public_id?: string; overwrite?: boolean }
+  ): Promise<CloudinaryUploadResult | null> {
+    Console({ type: "log", message: "Cloudinary upload (voice note ogg/opus)" });
+
+    if (!filePath || !fs.existsSync(filePath)) {
+      Console({ type: "error", message: "Arquivo inválido (filePath não existe)." });
+      return null;
+    }
+
+    const outOgg = this.tmpFile("ogg");
+    let pathToUpload = filePath;
+
+    try {
+      // 1) valida container/codec
+      const info = await this.ffprobeAudioInfo(filePath);
+
+      const isOgg = info.formatName.includes("ogg");
+      const isOpus = info.codecName.includes("opus");
+
+      if (!isOgg || !isOpus) {
+        Console({
+          type: "log",
+          message: `Convertendo para OGG/OPUS (format=${info.formatName} codec=${info.codecName})`,
+        });
+        await this.convertToOggOpus(filePath, outOgg);
+
+        // revalida (segurança)
+        const info2 = await this.ffprobeAudioInfo(outOgg);
+        if (!info2.formatName.includes("ogg") || !info2.codecName.includes("opus")) {
+          throw new Error(`Conversão falhou (format=${info2.formatName} codec=${info2.codecName})`);
+        }
+
+        pathToUpload = outOgg;
+      }
+
+      // 2) upload (Cloudinary usa resource_type=video para áudio)
+      const res = (await cloudinary.uploader.upload(pathToUpload, {
+        folder,
+        resource_type: "video",
+        overwrite: opts?.overwrite ?? true,
+
+        // força sair com extensão ogg no secure_url
+        format: "ogg",
+
+        // opcional: preservar nome
+        use_filename: true,
+        unique_filename: true,
+
+        ...(opts?.public_id ? { public_id: opts.public_id } : {}),
+        access_mode: "public",
+      })) as UploadApiResponse;
+
+      const normalized = this.normalizeResult(res);
+
+      // 3) hard guarantee: URL final deve ser .ogg
+      const url = String(normalized.secure_url || "");
+      if (!url.toLowerCase().includes(".ogg")) {
+        throw new Error(`Upload não retornou URL .ogg (secure_url=${url})`);
+      }
+
+      Console({ type: "success", message: "Upload voice note realizado (ogg/opus)." });
+      return normalized;
+    } catch (error) {
+      Console({
+        type: "error",
+        message: `Erro uploadVoiceNoteOggOpus: ${(error as Error).message}`,
+      });
+      return null;
+    } finally {
+      // apaga apenas o temporário criado
+      if (outOgg && outOgg !== filePath) this.safeUnlink(outOgg);
     }
   }
 

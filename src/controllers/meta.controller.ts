@@ -5,12 +5,13 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { configDotenv } from "dotenv";
-
+import { execFile } from "child_process";
 import Console, { ConsoleData } from "../lib/Console";
 import Atendimento from "../models/Atendimento";
 import MensagemModel, { MensagemTipo, MensagemTypes } from "../models/Mensagem";
-import CloudinaryController from "./cloudinary.controller";
+import CloudinaryController, { CloudinaryUploadResult } from "./cloudinary.controller";
 import { normalizeBRBase10 } from "../lib/phone";
+import { promisify } from "util";
 
 configDotenv();
 
@@ -18,6 +19,55 @@ configDotenv();
 /* Utils                                                                      */
 /* -------------------------------------------------------------------------- */
 
+function isProbablyWebmUrl(url: string) {
+  const u = (url || "").toLowerCase();
+  return u.includes(".webm") || u.includes("video/upload") || u.includes("audio/webm");
+}
+
+function ensureDir(dir: string) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function safeUnlink(p: string) {
+  try {
+    if (p && fs.existsSync(p)) fs.unlinkSync(p);
+  } catch { }
+}
+
+async function downloadToFile(url: string, outPath: string) {
+  const resp = await axios.get(url, { responseType: "stream", timeout: 60000 });
+  await new Promise<void>((resolve, reject) => {
+    const w = fs.createWriteStream(outPath);
+    resp.data.pipe(w);
+    w.on("finish", () => resolve());
+    w.on("error", reject);
+  });
+}
+
+async function convertToOggOpus(inputPath: string, outputPath: string) {
+  // ffmpeg -y -i input.webm -acodec libopus -ar 48000 -ac 1 output.ogg
+  // Observação: -ac 1 (mono) ajuda a ficar “mais WhatsApp-like”
+  await execFileAsync("ffmpeg", [
+    "-y",
+    "-i",
+    inputPath,
+    "-vn",
+    "-acodec",
+    "libopus",
+    "-ar",
+    "48000",
+    "-ac",
+    "1",
+    outputPath,
+  ]);
+}
+const execFileAsync = promisify(execFile);
+
+function withoutCaptionForAudio(type: string, input: any) {
+  // Meta dá 400 se mandar caption em audio
+  if (type === "audio") return {};
+  return input.caption ? { caption: input.caption } : {};
+}
 
 function pickWaIdFromMetaSend(meta: any): string | null {
   const wa = meta?.contacts?.[0]?.wa_id;
@@ -584,45 +634,155 @@ export default class MetaController {
 
     if (!to) throw new Error("Destino inválido (to).");
 
-    let link = input.link?.trim() || "";
+    const type = String(input.type || "").trim() as SendMediaInput["type"];
+    if (!type) throw new Error("Tipo inválido (type).");
+
+    const isAudio = type === "audio";
+
+    let link = (input.link || "").trim();
     let cloudinaryMeta: any = null;
 
+    // workspace tmp p/ conversões (somente áudio)
+    const tmpBase = path.join(os.tmpdir(), "meta-audio-convert");
+    if (isAudio) ensureDir(tmpBase);
+
+    // helpers locais (mantém função coesa e evita mexer no resto do controller)
+    const isProbablyOggUrl = (url: string) => {
+      const u = (url || "").toLowerCase();
+      return u.includes(".ogg") || u.includes("audio/ogg") || u.includes("format=ogg") || u.includes("/raw/upload/");
+    };
+
+    const tmpInPath = (ext = ".bin") =>
+      path.join(tmpBase, `in_${Date.now()}_${Math.random().toString(16).slice(2)}${ext.startsWith(".") ? ext : `.${ext}`}`);
+
+    const tmpOutOgg = () =>
+      path.join(tmpBase, `out_${Date.now()}_${Math.random().toString(16).slice(2)}.ogg`);
+
+    const convertLocalToOgg = async (sourcePath: string) => {
+      const out = tmpOutOgg();
+      await convertToOggOpus(sourcePath, out);
+      return out;
+    };
+
+    const uploadVoiceNoteStrict = async (localPath: string) => {
+      // ✅ usa a função nova especializada (garante ogg/opus e URL .ogg)
+      const up = await this.cloudinary.uploadVoiceNoteOggOpus(localPath, "meta/outbound");
+      if (!up?.secure_url) throw new Error("Falha ao subir áudio convertido (OGG) no Cloudinary");
+      if (!String(up.secure_url).toLowerCase().includes(".ogg")) {
+        throw new Error(`Upload de áudio não retornou .ogg (secure_url=${String(up.secure_url)})`);
+      }
+      return up;
+    };
+
+    /**
+     * 1) Se não veio link e veio filePath:
+     *    - audio: converter -> uploadVoiceNoteOggOpus -> link
+     *    - outros: uploadFile normal
+     */
     if (!link && input.filePath) {
-      Console({ type: "log", message: `[META][${reqId}] Upload Cloudinary (filePath) -> ${input.filePath}` });
-      const up = await this.cloudinary.uploadFile(input.filePath, "meta/outbound");
-      if (!up?.secure_url) throw new Error("Falha ao subir mídia no Cloudinary");
-      link = up.secure_url;
-      cloudinaryMeta = up;
+      const filePath = String(input.filePath);
+
+      if (isAudio) {
+        const ext = path.extname(filePath || "") || ".bin";
+        const inTmp = tmpInPath(ext);
+        let outOgg: string | null = null;
+
+        try {
+          fs.copyFileSync(filePath, inTmp);
+
+          Console({ type: "log", message: `[META][${reqId}] Áudio via filePath: convertendo -> OGG/OPUS` });
+          outOgg = await convertLocalToOgg(inTmp);
+
+          Console({ type: "log", message: `[META][${reqId}] Upload Cloudinary (voice note ogg/opus) -> ${outOgg}` });
+          const up = await uploadVoiceNoteStrict(outOgg);
+
+          link = up.secure_url;
+          cloudinaryMeta = up;
+
+          Console({ type: "log", message: `[META][${reqId}] Áudio final link=${link}` });
+        } finally {
+          safeUnlink(inTmp);
+          if (outOgg) safeUnlink(outOgg);
+        }
+      } else {
+        Console({ type: "log", message: `[META][${reqId}] Upload Cloudinary (filePath) -> ${filePath}` });
+        const up = await this.cloudinary.uploadFile(filePath, "meta/outbound");
+        if (!up?.secure_url) throw new Error("Falha ao subir mídia no Cloudinary");
+
+        link = up.secure_url;
+        cloudinaryMeta = up;
+      }
+    }
+
+    /**
+     * 2) Se veio link:
+     *    - audio:
+     *        a) se já parece ogg: mantém
+     *        b) senão: baixa -> converte -> uploadVoiceNoteOggOpus -> troca link
+     *    - outros: mantém
+     */
+    if (link && isAudio) {
+      if (!isProbablyOggUrl(link)) {
+        const inTmp = tmpInPath(".bin");
+        let outOgg: string | null = null;
+
+        try {
+          Console({ type: "log", message: `[META][${reqId}] Link de áudio não é ogg. Baixando p/ converter...` });
+          await downloadToFile(link, inTmp);
+
+          Console({ type: "log", message: `[META][${reqId}] Convertendo áudio (download) -> OGG/OPUS` });
+          outOgg = await convertLocalToOgg(inTmp);
+
+          Console({ type: "log", message: `[META][${reqId}] Upload Cloudinary (voice note ogg/opus) -> ${outOgg}` });
+          const up = await uploadVoiceNoteStrict(outOgg);
+
+          link = up.secure_url;
+          cloudinaryMeta = up;
+
+          Console({ type: "log", message: `[META][${reqId}] Áudio final link=${link}` });
+        } finally {
+          safeUnlink(inTmp);
+          if (outOgg) safeUnlink(outOgg);
+        }
+      } else {
+        Console({ type: "log", message: `[META][${reqId}] Link já parece OGG. Mantendo link=${link}` });
+      }
     }
 
     if (!link) throw new Error("Envie link ou filePath para mídia.");
 
+    /**
+     * 3) Monta payload Meta
+     * - áudio: NUNCA mandar caption
+     * - document: pode filename
+     */
     const payload: any = {
       messaging_product: "whatsapp",
       to,
-      type: input.type,
-      [input.type]: {
+      type,
+      [type]: {
         link,
-        ...(input.caption ? { caption: input.caption } : {}),
-        ...(input.type === "document" && input.filename ? { filename: input.filename } : {}),
+        ...withoutCaptionForAudio(type, input),
+        ...(type === "document" && input.filename ? { filename: input.filename } : {}),
       },
       ...(input.biz_opaque_callback_data ? { biz_opaque_callback_data: input.biz_opaque_callback_data } : {}),
     };
 
     Console({
       type: "log",
-      message: `[META][${reqId}] sendMedia -> /${phoneNumberId}/messages to=${to} type=${input.type}`,
+      message: `[META][${reqId}] sendMedia -> /${phoneNumberId}/messages to=${to} type=${type}`,
     });
     ConsoleData({ type: "log", data: { payload } });
 
     const t0 = Date.now();
     try {
       const res = await this.api.post<MetaSendResult>(`/${phoneNumberId}/messages`, payload);
+
       Console({ type: "success", message: `[META][${reqId}] sendMedia ok (${Date.now() - t0}ms)` });
       ConsoleData({ type: "log", data: res.data });
 
       const wamid = String(res.data?.messages?.[0]?.id || "");
-      const waId = pickWaIdFromMetaSend(res.data); // ✅
+      const waId = pickWaIdFromMetaSend(res.data);
 
       if (wamid) {
         await this.registerOutboundMessage({
@@ -630,11 +790,11 @@ export default class MetaController {
           wamid,
           toDigits: to,
           phoneNumberId,
-          type: input.type,
+          type,
           media: {
-            kind: input.type,
+            kind: type,
             link,
-            caption: input.caption,
+            caption: type === "audio" ? undefined : input.caption,
             filename: input.filename,
             meta: cloudinaryMeta ? { cloudinary: cloudinaryMeta } : undefined,
           },
@@ -652,6 +812,8 @@ export default class MetaController {
       throw e;
     }
   }
+
+
 
   async markAsRead(wamid: string, phoneNumberId?: string) {
     const reqId = makeReqId("mark_read");
