@@ -12,6 +12,8 @@ import cloudinaryRoutes from "./cloudinary.routes";
 import atendimentoRoutes from "./atendimento.routes";
 import petRoutes from "./pet.routes";
 import metaRoutes from "./meta.routes";
+import disparoRoutes from "./disparo.routes";
+import disparoItemRoutes from "./disparoItem.routes";
 
 const routes = Router();
 
@@ -37,4 +39,6 @@ routes.use("/pet", petRoutes);
 // meta
 routes.use("/meta", metaRoutes);
 
+routes.use("/disparos", disparoRoutes);
+routes.use("/disparo-items", disparoItemRoutes);
 export default routes;
