@@ -221,10 +221,9 @@ function mapStatusToMainStatus(s?: string): MensagemMainStatus {
 }
 
 export default class MensagemController {
-  /**
-   * Processa webhook da Meta (mensagens e/ou statuses).
-   * Idempotente: usa upsert por wamid.
-   */
+
+
+
   async processWebhook(payload: MetaWebhookPayload) {
     Console({ type: "log", message: "Processando webhook Meta (Mensagens/Statuses)..." });
 
@@ -242,31 +241,70 @@ export default class MensagemController {
 
         const doc = buildDocFromInboundMessage(payload, msg);
 
+        // Campos para criar SOMENTE na inserção (imutáveis / não sobrescrever)
+        const onInsert = {
+          wamid: String(wamid),
+          messageId: String(wamid),
+          // não repetir estes campos no $set!
+          direction: "INBOUND" as const,
+          type: doc.type,
+          // status inicial para inbound
+          status: "RECEIVED" as const,
+
+          // úteis para insert (se existirem)
+          phoneNumberId: doc.phoneNumberId,
+          wabaId: doc.wabaId,
+          from: doc.from,
+          to: doc.to,
+
+          // payload/tempo inicial
+          metaTimestamp: doc.metaTimestamp ?? null,
+          raw: payload,
+
+          // conteúdo inicial (se vier)
+          ...(doc.text ? { text: doc.text } : {}),
+          ...(doc.media ? { media: doc.media } : {}),
+          ...(doc.interactive ? { interactive: doc.interactive } : {}),
+          ...(doc.template ? { template: doc.template } : {}),
+          ...(doc.context ? { context: doc.context } : {}),
+          ...(doc.location ? { location: doc.location } : {}),
+          ...(doc.contacts ? { contacts: doc.contacts } : {}),
+          ...(doc.reaction ? { reaction: doc.reaction } : {}),
+        };
+
+        // Campos para atualizar SEM conflito com $setOnInsert
+        // (não tocar em type/direction aqui)
+        let toSet: any = {
+          raw: payload,
+          metaTimestamp: doc.metaTimestamp ?? null,
+
+          // pode atualizar metadados sem conflito
+          phoneNumberId: doc.phoneNumberId,
+          wabaId: doc.wabaId,
+          from: doc.from,
+
+          // inbound sempre "RECEIVED" quando chega message
+          status: "RECEIVED",
+
+          // conteúdo: só seta se existir
+          ...(doc.text ? { text: doc.text } : {}),
+          ...(doc.media ? { media: doc.media } : {}),
+          ...(doc.interactive ? { interactive: doc.interactive } : {}),
+          ...(doc.template ? { template: doc.template } : {}),
+          ...(doc.context ? { context: doc.context } : {}),
+          ...(doc.location ? { location: doc.location } : {}),
+          ...(doc.contacts ? { contacts: doc.contacts } : {}),
+          ...(doc.reaction ? { reaction: doc.reaction } : {}),
+        };
+
+        // remove undefined/null do $set (evita sujeira)
+        toSet = Object.fromEntries(Object.entries(toSet).filter(([, v]) => v !== undefined && v !== null));
+
         const upserted = await Mensagem.findOneAndUpdate(
-          { wamid },
+          { wamid: String(wamid) },
           {
-            $setOnInsert: doc,
-            // se cair aqui em duplicidade de webhook, não reescreve tudo
-            $set: {
-              // mantém raw atualizado, se você quiser
-              raw: payload,
-              metaTimestamp: doc.metaTimestamp ?? null,
-              phoneNumberId: doc.phoneNumberId,
-              wabaId: doc.wabaId,
-              from: doc.from,
-              type: doc.type,
-              // conteúdo: só seta se existir
-              ...(doc.text ? { text: doc.text } : {}),
-              ...(doc.media ? { media: doc.media } : {}),
-              ...(doc.interactive ? { interactive: doc.interactive } : {}),
-              ...(doc.template ? { template: doc.template } : {}),
-              ...(doc.context ? { context: doc.context } : {}),
-              ...(doc.location ? { location: doc.location } : {}),
-              ...(doc.contacts ? { contacts: doc.contacts } : {}),
-              ...(doc.reaction ? { reaction: doc.reaction } : {}),
-              direction: "INBOUND",
-              status: "RECEIVED",
-            },
+            $setOnInsert: onInsert,
+            $set: toSet,
           },
           { upsert: true, new: true }
         ).lean();
@@ -283,7 +321,7 @@ export default class MensagemController {
         const ts = toDateFromSeconds(st?.timestamp) || new Date();
 
         // busca atual pra evitar duplicar histórico
-        const current = await Mensagem.findOne({ wamid }, { statuses: 1 }).lean();
+        const current = await Mensagem.findOne({ wamid: String(wamid) }, { statuses: 1 }).lean();
 
         const nextStatuses = pushUniqueStatus(current?.statuses, {
           status: mainStatus,
@@ -292,7 +330,7 @@ export default class MensagemController {
         });
 
         const updated = await Mensagem.findOneAndUpdate(
-          { wamid },
+          { wamid: String(wamid) },
           {
             $set: {
               status: mainStatus,
@@ -324,6 +362,7 @@ export default class MensagemController {
       return { status: false, message: "Erro ao processar webhook.", data: null };
     }
   }
+
 
   /**
    * Busca mensagens por atendimento (thread interna).

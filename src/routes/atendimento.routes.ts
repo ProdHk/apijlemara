@@ -1,5 +1,5 @@
 // src/routes/atendimento.routes.ts
-import { Request, Response, Router } from "express";
+import { Router } from "express";
 import Console, { ConsoleData } from "../lib/Console";
 
 import AtendimentoController, {
@@ -10,7 +10,7 @@ const router = Router();
 const controller = new AtendimentoController();
 
 /* -------------------------------------------------------------------------- */
-/*  HELPERS                                                                   */
+/* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 function ok(res: any, payload: any, status = 200) {
   return res.status(status).json(payload);
@@ -63,52 +63,17 @@ function toSortBy(v: any): "updatedAt" | "createdAt" | "dataAtualizacao" | undef
 }
 
 /* -------------------------------------------------------------------------- */
-/*  ROTAS                                                                     */
+/* Rotas "legadas" (handlers no controller usando { req, res })               */
 /* -------------------------------------------------------------------------- */
-
-
-
-
-
 router.get("/atendimentos-ativos", (req, res) => controller.buscarAtivos({ req, res }));
 router.post("/atendimentos-ativos-atendente", (req, res) => controller.buscarAtivosAtendente({ req, res }));
 router.post("/atendimentos-por-status", (req, res) => controller.buscarPorStatus({ req, res }));
 router.post("/atendimentos-por-fila", (req, res) => controller.buscarPorFila({ req, res }));
 router.get("/metricas-atuais", (req, res) => controller.buscarMetricasAtuais({ req, res }));
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/* -------------------------------------------------------------------------- */
+/* Health                                                                     */
+/* -------------------------------------------------------------------------- */
 /**
  * GET /api/atendimentos/health
  */
@@ -121,23 +86,65 @@ router.get("/health", async (_req, res) => {
   });
 });
 
+/* -------------------------------------------------------------------------- */
+/* Consultas específicas (DEVEM vir antes de "/:id")                           */
+/* -------------------------------------------------------------------------- */
+/**
+ * GET /api/atendimentos/ativos/por-numero?numeroWhatsapp=...&tipo=...
+ */
+router.get("/ativos/por-numero", async (req, res) => {
+  Console({ type: "log", message: "GET /api/atendimentos/ativos/por-numero" });
+
+  try {
+    const numeroWhatsapp = digits(String(req.query.numeroWhatsapp || ""));
+    const tipo = req.query.tipo ? (String(req.query.tipo) as any) : undefined;
+
+    if (!numeroWhatsapp) {
+      return ok(res, { status: false, message: "numeroWhatsapp não informado.", data: null }, 400);
+    }
+
+    const data = await controller.buscarAtivosPorNumero(numeroWhatsapp, tipo);
+    if (!data) {
+      return ok(res, { status: false, message: "Nenhum atendimento ativo encontrado.", data: null }, 404);
+    }
+
+    return ok(res, { status: true, message: "Atendimento ativo encontrado.", data });
+  } catch (error) {
+    return err(res, error, "Erro ao buscar atendimento ativo por número");
+  }
+});
+
+/**
+ * GET /api/atendimentos/ativos/por-waid?waId=...&tipo=...
+ * (✅ faltava essa rota)
+ */
+router.get("/ativos/por-waid", async (req, res) => {
+  Console({ type: "log", message: "GET /api/atendimentos/ativos/por-waid" });
+
+  try {
+    const waId = digits(String(req.query.waId || ""));
+    const tipo = req.query.tipo ? (String(req.query.tipo) as any) : undefined;
+
+    if (!waId) {
+      return ok(res, { status: false, message: "waId não informado.", data: null }, 400);
+    }
+
+    const data = await controller.buscarAtivosPorWaId(waId, tipo);
+    if (!data) {
+      return ok(res, { status: false, message: "Nenhum atendimento ativo encontrado.", data: null }, 404);
+    }
+
+    return ok(res, { status: true, message: "Atendimento ativo encontrado.", data });
+  } catch (error) {
+    return err(res, error, "Erro ao buscar atendimento ativo por waId");
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* Lista avançada                                                             */
+/* -------------------------------------------------------------------------- */
 /**
  * GET /api/atendimentos
- * Query (tudo opcional):
- *  - status=aberto,aguardando-atendente
- *  - tipo=cobranca,venda
- *  - atendente=null | "" | "<id>"
- *      - omitido => não filtra
- *      - atendente= (vazio) => sem atendente
- *      - atendente=<id> => atendente específico
- *  - clienteId, clienteNome, clienteRef, numeroWhatsapp
- *  - dataDe, dataAte (dataInicio)
- *  - updatedDe, updatedAte (updatedAt)
- *  - resultadoContato
- *  - q
- *  - page, limit
- *  - sortBy=updatedAt|createdAt|dataAtualizacao
- *  - sortDir=asc|desc
  */
 router.get("/", async (req, res) => {
   Console({ type: "log", message: "GET /api/atendimentos" });
@@ -147,9 +154,10 @@ router.get("/", async (req, res) => {
     const tipo = splitCsv(req.query.tipo);
 
     // atendente:
-    // - se vier "null" -> manda null (controller entende como sem filtro)
-    // - se vier "" -> string vazia (controller entende como "sem atendente")
-    // - se vier id -> id
+    // - omitido => não filtra (undefined)
+    // - "null"  => null (controller trata como "sem filtro", conforme seu comentário)
+    // - ""      => string vazia (controller trata como "sem atendente")
+    // - "<id>"  => id
     let atendente: any = undefined;
     if (req.query.atendente !== undefined) {
       const a = String(req.query.atendente);
@@ -167,11 +175,11 @@ router.get("/", async (req, res) => {
 
       numeroWhatsapp: req.query.numeroWhatsapp ? digits(String(req.query.numeroWhatsapp)) : undefined,
 
-      dataDe: toDateOrNull(req.query.dataDe) as Date,
-      dataAte: toDateOrNull(req.query.dataAte) as Date,
+      dataDe: (toDateOrNull(req.query.dataDe) as any) ?? undefined,
+      dataAte: (toDateOrNull(req.query.dataAte) as any) ?? undefined,
 
-      updatedDe: toDateOrNull(req.query.updatedDe) as Date,
-      updatedAte: toDateOrNull(req.query.updatedAte) as Date,
+      updatedDe: (toDateOrNull(req.query.updatedDe) as any) ?? undefined,
+      updatedAte: (toDateOrNull(req.query.updatedAte) as any) ?? undefined,
 
       q: req.query.q ? String(req.query.q) : undefined,
 
@@ -181,112 +189,22 @@ router.get("/", async (req, res) => {
       sortBy: toSortBy(req.query.sortBy),
       sortDir: toSortDir(req.query.sortDir),
 
-      resultadoContato: req.query.resultadoContato
-        ? (String(req.query.resultadoContato) as any)
-        : undefined,
+      resultadoContato: req.query.resultadoContato ? (String(req.query.resultadoContato) as any) : undefined,
     };
 
     const data = await controller.listar(params);
 
-    return ok(res, {
-      status: true,
-      message: "Atendimentos listados com sucesso!",
-      data,
-    });
+    return ok(res, { status: true, message: "Atendimentos listados com sucesso!", data });
   } catch (error) {
     return err(res, error, "Erro ao listar atendimentos");
   }
 });
 
-/**
- * GET /api/atendimentos/:id
- */
-router.get("/:id", async (req, res) => {
-  Console({ type: "log", message: "GET /api/atendimentos/:id" });
-
-  try {
-    const id = String(req.params.id || "").trim();
-    if (!id) {
-      return ok(res, { status: false, message: "ID não informado.", data: null }, 400);
-    }
-
-    const data = await controller.buscarPorId(id);
-    if (!data) {
-      return ok(res, { status: false, message: "Atendimento não encontrado.", data: null }, 404);
-    }
-
-    return ok(res, { status: true, message: "Atendimento encontrado.", data });
-  } catch (error) {
-    return err(res, error, "Erro ao buscar atendimento");
-  }
-});
-
-/**
- * GET /api/atendimentos/:id/detalhe
- * Retorna: { atendimento, metricas }
- */
-router.get("/:id/detalhe", async (req, res) => {
-  Console({ type: "log", message: "GET /api/atendimentos/:id/detalhe" });
-
-  try {
-    const id = String(req.params.id || "").trim();
-    if (!id) {
-      return ok(res, { status: false, message: "ID não informado.", data: null }, 400);
-    }
-
-    const data = await controller.detalhe(id);
-    if (!data) {
-      return ok(res, { status: false, message: "Atendimento não encontrado.", data: null }, 404);
-    }
-
-    return ok(res, { status: true, message: "Detalhe carregado.", data });
-  } catch (error) {
-    return err(res, error, "Erro ao buscar detalhe do atendimento");
-  }
-});
-
-/**
- * GET /api/atendimentos/ativos/por-numero?numeroWhatsapp=...&tipo=...
- * Retorna o atendimento ativo (se existir)
- */
-router.get("/ativos/por-numero", async (req, res) => {
-  Console({ type: "log", message: "GET /api/atendimentos/ativos/por-numero" });
-
-  try {
-    const numeroWhatsapp = digits(String(req.query.numeroWhatsapp || ""));
-    const tipo = req.query.tipo ? (String(req.query.tipo) as any) : undefined;
-
-    if (!numeroWhatsapp) {
-      return ok(
-        res,
-        { status: false, message: "numeroWhatsapp não informado.", data: null },
-        400
-      );
-    }
-
-    const data = await controller.buscarAtivosPorNumero(numeroWhatsapp, tipo);
-    if (!data) {
-      return ok(res, { status: false, message: "Nenhum atendimento ativo encontrado.", data: null }, 404);
-    }
-
-    return ok(res, { status: true, message: "Atendimento ativo encontrado.", data });
-  } catch (error) {
-    return err(res, error, "Erro ao buscar atendimento ativo por número");
-  }
-});
-
+/* -------------------------------------------------------------------------- */
+/* Mutations                                                                  */
+/* -------------------------------------------------------------------------- */
 /**
  * POST /api/atendimentos/ensure
- * Body:
- * {
- *   numeroWhatsapp: string,
- *   tipo?: "venda"|"cobranca"|"compra"|"lembrete"|"outro",
- *   atendente?: string|null,
- *   clienteId: string,
- *   clienteNome?: string,
- *   clienteRef?: string|null,
- *   observacao?: string
- * }
  */
 router.post("/ensure", async (req, res) => {
   Console({ type: "log", message: "POST /api/atendimentos/ensure" });
@@ -311,6 +229,8 @@ router.post("/ensure", async (req, res) => {
       clienteId,
       clienteNome: body.clienteNome,
       clienteRef: body.clienteRef ?? null,
+      // se você já envia waId no body, aproveita:
+      waId: body.waId ?? null,
       observacao: body.observacao,
     });
 
@@ -326,12 +246,6 @@ router.post("/ensure", async (req, res) => {
 
 /**
  * POST /api/atendimentos/anexar-mensagem
- * Body:
- * {
- *   atendimentoId: string,
- *   mensagemId: string,
- *   meta: { direction: "INBOUND"|"OUTBOUND", ts?: string|Date|null, actor?: string }
- * }
  */
 router.post("/anexar-mensagem", async (req, res) => {
   Console({ type: "log", message: "POST /api/atendimentos/anexar-mensagem" });
@@ -372,9 +286,49 @@ router.post("/anexar-mensagem", async (req, res) => {
   }
 });
 
+/* -------------------------------------------------------------------------- */
+/* Rotas por ID (DEVEM vir por último)                                        */
+/* -------------------------------------------------------------------------- */
+/**
+ * GET /api/atendimentos/:id/detalhe
+ */
+router.get("/:id/detalhe", async (req, res) => {
+  Console({ type: "log", message: "GET /api/atendimentos/:id/detalhe" });
+
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return ok(res, { status: false, message: "ID não informado.", data: null }, 400);
+
+    const data = await controller.detalhe(id);
+    if (!data) return ok(res, { status: false, message: "Atendimento não encontrado.", data: null }, 404);
+
+    return ok(res, { status: true, message: "Detalhe carregado.", data });
+  } catch (error) {
+    return err(res, error, "Erro ao buscar detalhe do atendimento");
+  }
+});
+
+/**
+ * GET /api/atendimentos/:id
+ */
+router.get("/:id", async (req, res) => {
+  Console({ type: "log", message: "GET /api/atendimentos/:id" });
+
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return ok(res, { status: false, message: "ID não informado.", data: null }, 400);
+
+    const data = await controller.buscarPorId(id);
+    if (!data) return ok(res, { status: false, message: "Atendimento não encontrado.", data: null }, 404);
+
+    return ok(res, { status: true, message: "Atendimento encontrado.", data });
+  } catch (error) {
+    return err(res, error, "Erro ao buscar atendimento");
+  }
+});
+
 /**
  * POST /api/atendimentos/:id/transferir
- * Body: { novaAtendenteId: string|null, actor?: string }
  */
 router.post("/:id/transferir", async (req, res) => {
   Console({ type: "log", message: "POST /api/atendimentos/:id/transferir" });
@@ -388,13 +342,8 @@ router.post("/:id/transferir", async (req, res) => {
 
     const actor = req.body?.actor ? String(req.body.actor) : "system";
 
-    // valida: se não for null, não pode ser string vazia
     if (novaAtendenteId !== null && !novaAtendenteId) {
-      return ok(
-        res,
-        { status: false, message: "novaAtendenteId inválido (use null ou um id).", data: null },
-        400
-      );
+      return ok(res, { status: false, message: "novaAtendenteId inválido (use null ou um id).", data: null }, 400);
     }
 
     const data = await controller.transferir(id, novaAtendenteId, actor);
@@ -408,7 +357,6 @@ router.post("/:id/transferir", async (req, res) => {
 
 /**
  * POST /api/atendimentos/:id/finalizar
- * Body: { resultadoContato?: ResultadoContato|null, actor?: string }
  */
 router.post("/:id/finalizar", async (req, res) => {
   Console({ type: "log", message: "POST /api/atendimentos/:id/finalizar" });
@@ -436,7 +384,6 @@ router.post("/:id/finalizar", async (req, res) => {
 
 /**
  * POST /api/atendimentos/:id/reabrir
- * Body: { actor?: string }
  */
 router.post("/:id/reabrir", async (req, res) => {
   Console({ type: "log", message: "POST /api/atendimentos/:id/reabrir" });
@@ -455,10 +402,6 @@ router.post("/:id/reabrir", async (req, res) => {
     return err(res, error, "Erro ao reabrir atendimento");
   }
 });
-
-
-
-
 
 const atendimentoRoutes = router;
 export default atendimentoRoutes;

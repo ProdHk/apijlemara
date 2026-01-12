@@ -1,5 +1,6 @@
 // src/controllers/atendimento.controller.ts
 import mongoose, { Types } from "mongoose";
+import type { Request, Response } from "express";
 import Console, { ConsoleData } from "../lib/Console";
 
 import Atendimento, {
@@ -9,12 +10,11 @@ import Atendimento, {
   ResultadoContato,
   HistoricoType,
 } from "../models/Atendimento";
-import type { Request, Response } from "express";
+
 type SortBy = "updatedAt" | "createdAt" | "dataAtualizacao";
 type SortDir = "asc" | "desc";
 
 export type ListarAtendimentosParams = {
-
   status?: AtendimentoStatus[];
   tipo?: AtendimentoTipo[];
   atendente?: string | null; // null => sem filtro | "" => sem atendente | "id" => específico
@@ -58,19 +58,11 @@ type AttachMessageMeta = {
   actor?: string; // "system" | userId | nome
 };
 
-/*
-
-
-
-
-*/
-
-
 type ResponseType = {
-  status: boolean
+  status: boolean;
   message: string;
   data: any;
-}
+};
 
 export type MetricasAtuaisDTO = {
   total: number;
@@ -81,11 +73,21 @@ export type MetricasAtuaisDTO = {
   porResultadoContato: Partial<Record<ResultadoContato, number>>;
 
   semAtendenteAtivos: number;
-  atrasados24h: number; // ativos sem atualização há 24h
+  atrasados24h: number;
 
-  ultimos7dias: { dia: string; total: number }[]; // YYYY-MM-DD
+  ultimos7dias: { dia: string; total: number }[];
 };
 
+/* -------------------------------------------------------------------------- */
+/* Consts                                                                     */
+/* -------------------------------------------------------------------------- */
+
+const ATIVOS: AtendimentoStatus[] = ["aberto", "aguardando-cliente", "aguardando-atendente"];
+const INATIVOS: AtendimentoStatus[] = ["fechado", "cancelado"];
+
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
 
 function toPublic(doc: any) {
   return doc ? { ...doc, _id: String(doc._id) } : doc;
@@ -94,6 +96,21 @@ function toPublic(doc: any) {
 function digits(v?: string | null) {
   if (!v) return "";
   return String(v).replace(/\D+/g, "");
+}
+
+function normalizeBRToCanonicalE164(d: string) {
+  const v = digits(d);
+  if (!v.startsWith("55")) return v;
+
+  if (v.length < 12) return v;
+
+  const ddd = v.slice(2, 4);
+  const rest = v.slice(4);
+
+  if (rest.length === 8) return `55${ddd}9${rest}`; // adiciona 9
+  if (rest.length === 9) return `55${ddd}${rest}`; // ok
+
+  return v;
 }
 
 function now() {
@@ -109,64 +126,127 @@ function buildHistory(title: string, content: string, user = "system"): Historic
   return { title, content, user, date: now() };
 }
 
-
-
-
-function ok(res: any, data: any) {
+function ok(res: Response, data: any) {
   return res.status(200).json(data);
 }
 
-function fail(res: any, error: unknown, fallback = "Erro interno") {
+function fail(res: Response, error: unknown, fallback = "Erro interno") {
   const message = error instanceof Error ? error.message : fallback;
   Console({ type: "error", message });
   ConsoleData({ type: "error", data: error });
   return res.status(500).json({ status: false, message, data: null });
 }
 
-
+function pickDefined<T extends object>(obj: T) {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
+}
 
 /**
- * Estratégia anti-duplicidade:
- * - 1 atendimento por (numeroWhatsapp) + (tipo) enquanto estiver ativo (aberto/aguardando-*).
- * - Se existir ativo, atualiza; se não existir, cria.
- * - Se existir fechado/cancelado e chegar nova interação, reabre o mais recente do mesmo numeroWhatsapp+tipo.
- *
- * Obs: Seu model não tem "phoneNumberId". Então a unicidade é por numeroWhatsapp.
- * Se você tiver múltiplos números da empresa, recomendo adicionar depois: phoneNumberId + index.
+ * Resolve "chave" do cliente para não duplicar:
+ * prioridade:
+ * 1) waId (Meta)
+ * 2) numeroWhatsappCanon (BR com 9º dígito)
+ * 3) aliases (original/canon)
  */
-const ATIVOS: AtendimentoStatus[] = ["aberto", "aguardando-cliente", "aguardando-atendente"];
-const INATIVOS: AtendimentoStatus[] = ["fechado", "cancelado"];
+function buildCustomerKey(params: {
+  numeroWhatsapp?: string;
+  numeroWhatsappCanon?: string;
+  waId?: string | null;
+}) {
+  const waId = digits(params.waId || "");
+  const canon = digits(params.numeroWhatsappCanon || normalizeBRToCanonicalE164(params.numeroWhatsapp || ""));
+  const original = digits(params.numeroWhatsapp || "");
+
+  return {
+    waId,
+    canon,
+    original,
+    aliases: Array.from(new Set([original, canon].filter(Boolean))),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Controller                                                                 */
+/* -------------------------------------------------------------------------- */
 
 export default class AtendimentoController {
   // =========================
   // CORE: garantir atendimento (sem duplicar)
   // =========================
   async ensure(params: {
-    numeroWhatsapp: string; // cliente digits
+    numeroWhatsapp: string; // cliente digits (pode vir sem 9º dígito)
     tipo?: AtendimentoTipo;
     atendente?: string | Types.ObjectId | null;
 
-    clienteId: string;
+    clienteId: string; // sua chave interna (pode ser waId/canon etc)
     clienteNome?: string;
     clienteRef?: string | null;
+
+    // NOVO (se existir no model atualizado)
+    waId?: string | null;
 
     observacao?: string;
   }) {
     Console({ type: "log", message: "Ensure atendimento (sem duplicidade)..." });
 
     try {
-      const numeroWhatsapp = digits(params.numeroWhatsapp);
-      if (!numeroWhatsapp) throw new Error("numeroWhatsapp é obrigatório");
+      const { waId, canon, original, aliases } = buildCustomerKey({
+        numeroWhatsapp: params.numeroWhatsapp,
+        waId: params.waId,
+      });
+
+      if (!canon) throw new Error("numeroWhatsapp é obrigatório");
       if (!params.clienteId) throw new Error("clienteId é obrigatório");
 
       const tipo: AtendimentoTipo = params.tipo ?? "outro";
       const agora = now();
 
-      // 1) tenta achar ativo (mais performático que sort+find em muitos casos)
+      // 1) tenta achar ativo por waId (melhor chave)
+      if (waId) {
+        const byWa = await Atendimento.findOne({
+          waId,
+          tipo,
+          status: { $in: ATIVOS },
+        })
+          .select("_id status dataFim dataPrimeiraRespostaAtendente")
+          .lean();
+
+        if (byWa?._id) {
+          const patch: Partial<AtendimentoType> = {
+            dataAtualizacao: agora,
+            atendente: params.atendente ?? undefined,
+            clienteNome: params.clienteNome ?? undefined,
+            clienteRef: params.clienteRef ?? undefined,
+            observacao: params.observacao ?? undefined,
+
+            // mantém consistência (se existirem no model)
+            numeroWhatsapp: canon as any,
+            numeroWhatsappCanon: canon as any,
+          } as any;
+
+          const updated = await Atendimento.findByIdAndUpdate(
+            byWa._id,
+            {
+              $set: pickDefined(patch),
+              ...(aliases.length ? { $addToSet: { numeroWhatsappAliases: { $each: aliases } } } : {}),
+            },
+            { new: true }
+          ).lean();
+
+          return toPublic(updated);
+        }
+      }
+
+      // 2) tenta achar ativo por canon/aliases
       const ativo = await Atendimento.findOne({
-        numeroWhatsapp,
         tipo,
         status: { $in: ATIVOS },
+        $or: [
+          { numeroWhatsappCanon: canon },
+          { numeroWhatsapp: canon }, // legado
+          { numeroWhatsappAliases: canon },
+          ...(original ? [{ numeroWhatsappAliases: original }] : []),
+        ],
       })
         .select("_id status dataFim dataPrimeiraRespostaAtendente")
         .lean();
@@ -178,22 +258,36 @@ export default class AtendimentoController {
           clienteNome: params.clienteNome ?? undefined,
           clienteRef: params.clienteRef ?? undefined,
           observacao: params.observacao ?? undefined,
-        };
+
+          // se tiver waId, grava
+          ...(waId ? ({ waId } as any) : {}),
+          numeroWhatsapp: canon as any,
+          numeroWhatsappCanon: canon as any,
+        } as any;
 
         const updated = await Atendimento.findByIdAndUpdate(
           ativo._id,
-          { $set: pickDefined(patch) },
+          {
+            $set: pickDefined(patch),
+            ...(aliases.length ? { $addToSet: { numeroWhatsappAliases: { $each: aliases } } } : {}),
+          },
           { new: true }
         ).lean();
 
         return toPublic(updated);
       }
 
-      // 2) não tem ativo -> tenta reabrir o mais recente inativo
+      // 3) não tem ativo -> tenta reabrir o mais recente inativo (waId > canon/aliases)
       const inativo = await Atendimento.findOne({
-        numeroWhatsapp,
         tipo,
         status: { $in: INATIVOS },
+        $or: [
+          ...(waId ? [{ waId }] : []),
+          { numeroWhatsappCanon: canon },
+          { numeroWhatsapp: canon },
+          { numeroWhatsappAliases: canon },
+          ...(original ? [{ numeroWhatsappAliases: original }] : []),
+        ],
       })
         .sort({ updatedAt: -1 })
         .select("_id status")
@@ -212,7 +306,12 @@ export default class AtendimentoController {
               clienteNome: params.clienteNome ?? undefined,
               clienteRef: params.clienteRef ?? undefined,
               observacao: params.observacao ?? undefined,
-            }),
+
+              ...(waId ? ({ waId } as any) : {}),
+              numeroWhatsapp: canon as any,
+              numeroWhatsappCanon: canon as any,
+            } as any),
+            ...(aliases.length ? { $addToSet: { numeroWhatsappAliases: { $each: aliases } } } : {}),
             $push: {
               historico: buildHistory(
                 "Atendimento reaberto",
@@ -227,7 +326,7 @@ export default class AtendimentoController {
         return toPublic(updated);
       }
 
-      // 3) cria novo
+      // 4) cria novo
       const created = await Atendimento.create({
         atendente: params.atendente ?? null,
         status: "aberto",
@@ -243,11 +342,18 @@ export default class AtendimentoController {
         anexos: [],
         historico: [],
 
-        numeroWhatsapp,
+        // ✅ canonical por padrão
+        numeroWhatsapp: canon,
+        numeroWhatsappCanon: canon,
+        numeroWhatsappAliases: aliases,
 
+        // ✅ chave interna
         clienteId: params.clienteId,
         clienteNome: params.clienteNome ?? "",
         clienteRef: params.clienteRef ?? null,
+
+        // ✅ se existir
+        ...(waId ? { waId } : {}),
 
         dataPrimeiraRespostaAtendente: null,
         dataUltimaMensagemCliente: null,
@@ -350,10 +456,19 @@ export default class AtendimentoController {
   async buscarAtivosPorNumero(numeroWhatsapp: string, tipo?: AtendimentoTipo) {
     Console({ type: "log", message: "Buscando atendimento ativo por número..." });
     try {
-      const phone = digits(numeroWhatsapp);
-      if (!phone) return null;
+      const original = digits(numeroWhatsapp);
+      if (!original) return null;
+      const canon = normalizeBRToCanonicalE164(original);
 
-      const filter: any = { numeroWhatsapp: phone, status: { $in: ATIVOS } };
+      const filter: any = {
+        status: { $in: ATIVOS },
+        $or: [
+          { numeroWhatsappCanon: canon },
+          { numeroWhatsapp: canon },
+          { numeroWhatsappAliases: canon },
+          { numeroWhatsappAliases: original },
+        ],
+      };
       if (tipo) filter.tipo = tipo;
 
       const doc = await Atendimento.findOne(filter).sort({ updatedAt: -1 }).lean();
@@ -365,8 +480,26 @@ export default class AtendimentoController {
     }
   }
 
+  async buscarAtivosPorWaId(waId: string, tipo?: AtendimentoTipo) {
+    Console({ type: "log", message: "Buscando atendimento ativo por waId..." });
+    try {
+      const w = digits(waId);
+      if (!w) return null;
+
+      const filter: any = { waId: w, status: { $in: ATIVOS } };
+      if (tipo) filter.tipo = tipo;
+
+      const doc = await Atendimento.findOne(filter).sort({ updatedAt: -1 }).lean();
+      return toPublic(doc);
+    } catch (error) {
+      Console({ type: "error", message: "Erro ao buscar atendimento por waId." });
+      ConsoleData({ type: "error", data: error });
+      return null;
+    }
+  }
+
   // =========================
-  // LISTA AVANÇADA (robusta e performática)
+  // LISTA AVANÇADA
   // =========================
   async listar(params: ListarAtendimentosParams = {}): Promise<ListarAtendimentosResponse> {
     try {
@@ -390,10 +523,7 @@ export default class AtendimentoController {
       if (params.atendente !== undefined && params.atendente !== null) {
         const a = String(params.atendente);
         if (a.trim() === "") {
-          filter.$or = [
-            { atendente: { $exists: false } },
-            { atendente: null },
-          ];
+          filter.$or = [{ atendente: { $exists: false } }, { atendente: null }];
         } else {
           filter.atendente = a;
         }
@@ -402,7 +532,20 @@ export default class AtendimentoController {
       if (params.clienteId) filter.clienteId = String(params.clienteId);
       if (params.clienteRef) filter.clienteRef = String(params.clienteRef);
 
-      if (params.numeroWhatsapp) filter.numeroWhatsapp = digits(params.numeroWhatsapp);
+      if (params.clienteNome) filter.clienteNome = safeRegex(String(params.clienteNome));
+
+      if (params.numeroWhatsapp) {
+        const original = digits(params.numeroWhatsapp);
+        const canon = normalizeBRToCanonicalE164(original);
+
+        filter.$or = [
+          ...(filter.$or || []),
+          { numeroWhatsappCanon: canon },
+          { numeroWhatsapp: canon },
+          { numeroWhatsappAliases: canon },
+          ...(original ? [{ numeroWhatsappAliases: original }] : []),
+        ];
+      }
 
       // datas: dataInicio
       if (params.dataDe || params.dataAte) {
@@ -418,15 +561,17 @@ export default class AtendimentoController {
         if (params.updatedAte) filter.updatedAt.$lte = params.updatedAte;
       }
 
-      // resultado contato (é string simples no model atual)
       if (params.resultadoContato) filter.resultadoContato = String(params.resultadoContato);
 
-      // busca textual simples (sem text-index para manter easycode)
+      // busca textual simples
       if (params.q && String(params.q).trim()) {
         const rx = safeRegex(String(params.q).trim());
         filter.$or = [
           ...(filter.$or || []),
           { numeroWhatsapp: rx },
+          { numeroWhatsappCanon: rx },
+          { numeroWhatsappAliases: rx },
+          { waId: rx },
           { clienteId: rx },
           { clienteNome: rx },
           { clienteRef: rx },
@@ -436,11 +581,7 @@ export default class AtendimentoController {
 
       const [total, docs] = await Promise.all([
         Atendimento.countDocuments(filter),
-        Atendimento.find(filter)
-          .sort(sort)
-          .skip(skip)
-          .limit(limit)
-          .lean(),
+        Atendimento.find(filter).sort(sort).skip(skip).limit(limit).lean(),
       ]);
 
       const items = (docs || []).map(toPublic);
@@ -583,125 +724,100 @@ export default class AtendimentoController {
     return { atendimento, metricas };
   }
 
-
-
-
-
-
-
-
-
-
-
-
-  async buscarAtivos({ req, res }: { req: Request, res: Response }) {
-
+  // =========================
+  // HANDLERS (HTTP) - mantém compatibilidade do seu projeto
+  // =========================
+  async buscarAtivos({ req, res }: { req: Request; res: Response }) {
     Console({ type: "log", message: "GET /api/atendimento/atendimentos-ativos" });
 
-    let response: ResponseType
     try {
       const result = await Atendimento.find({ status: { $in: ATIVOS } }).lean();
-      response = {
+      const response: ResponseType = {
         status: true,
         message: "Atendimentos ativos encontrados",
-        data: result
-      }
-      return ok(res, response)
+        data: result.map(toPublic),
+      };
+      return ok(res, response);
     } catch (error) {
-      return fail(res, error, "Erro ao buscar atendimentos ativos")
+      return fail(res, error, "Erro ao buscar atendimentos ativos");
     }
   }
 
-
-
-  async buscarAtivosAtendente({ req, res }: { req: Request, res: Response }) {
-
+  async buscarAtivosAtendente({ req, res }: { req: Request; res: Response }) {
     Console({ type: "log", message: "GET /api/atendimento/atendimentos-ativos-atendente" });
 
-    let response: ResponseType
     try {
+      const { atendente } = req.body;
 
-      const { atendente } = req.body
+      const filter: any = { status: { $in: ATIVOS } };
+      if (String(atendente || "").trim()) filter.atendente = String(atendente);
 
-      const result = await Atendimento.find({ status: { $in: ATIVOS }, $and: [{ atendente }] }).lean();
-
-      response = {
+      const result = await Atendimento.find(filter).lean();
+      const response: ResponseType = {
         status: true,
         message: "Atendimentos ativos encontrados",
-        data: result
-      }
-      return ok(res, response)
+        data: result.map(toPublic),
+      };
+      return ok(res, response);
     } catch (error) {
-      return fail(res, error, "Erro ao buscar atendimentos ativos")
+      return fail(res, error, "Erro ao buscar atendimentos ativos");
     }
   }
-  async buscarPorStatus({ req, res }: { req: Request, res: Response }) {
 
+  async buscarPorStatus({ req, res }: { req: Request; res: Response }) {
     Console({ type: "log", message: "GET /api/atendimento/atendimentos-por-status" });
 
-    let response: ResponseType
     try {
-
-      const { status } = req.body
+      const { status } = req.body;
       const result = await Atendimento.find({ status }).lean();
 
-      response = {
+      const response: ResponseType = {
         status: true,
-        message: "Atendimentos ativos encontrados",
-        data: result
-      }
+        message: "Atendimentos encontrados",
+        data: result.map(toPublic),
+      };
 
-      return ok(res, response)
+      return ok(res, response);
     } catch (error) {
-      return fail(res, error, "Erro ao buscar atendimentos ativos")
+      return fail(res, error, "Erro ao buscar atendimentos");
     }
   }
-  async buscarPorFila({ req, res }: { req: Request, res: Response }) {
 
+  async buscarPorFila({ req, res }: { req: Request; res: Response }) {
     Console({ type: "log", message: "GET /api/atendimento/atendimentos-por-fila" });
 
-    let response: ResponseType
-    const { fila } = req.body
-
     try {
-
+      const { fila } = req.body;
       const result = await Atendimento.find({ tipo: fila }).lean();
 
-      response = {
+      const response: ResponseType = {
         status: true,
-        message: "Atendimentos da fila " + fila + "  encontrados",
-        data: result
-      }
+        message: "Atendimentos da fila " + fila + " encontrados",
+        data: result.map(toPublic),
+      };
 
-      return ok(res, response)
+      return ok(res, response);
     } catch (error) {
-      return fail(res, error, "Erro ao buscar atendimentos da fila " + fila)
+      return fail(res, error, "Erro ao buscar atendimentos da fila " + req.body?.fila);
     }
   }
+
   async buscarMetricasAtuais({ req, res }: { req: Request; res: Response }) {
     Console({ type: "log", message: "GET /api/atendimento/metricas-atuais" });
 
     try {
-      const now = new Date();
-      const d24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-      const d7 = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      const _now = new Date();
+      const d24h = new Date(_now.getTime() - 24 * 60 * 60 * 1000);
+      const d7 = new Date(_now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
       const [agg] = await Atendimento.aggregate([
         {
           $facet: {
             total: [{ $count: "v" }],
-            totalAtivos: [
-              { $match: { status: { $in: ATIVOS } } },
-              { $count: "v" },
-            ],
+            totalAtivos: [{ $match: { status: { $in: ATIVOS } } }, { $count: "v" }],
 
-            porStatus: [
-              { $group: { _id: "$status", v: { $sum: 1 } } },
-            ],
-
-            porTipo: [
-              { $group: { _id: "$tipo", v: { $sum: 1 } } },
-            ],
+            porStatus: [{ $group: { _id: "$status", v: { $sum: 1 } } }],
+            porTipo: [{ $group: { _id: "$tipo", v: { $sum: 1 } } }],
 
             porResultadoContato: [
               { $match: { resultadoContato: { $ne: null } } },
@@ -718,10 +834,7 @@ export default class AtendimentoController {
               { $count: "v" },
             ],
 
-            atrasados24h: [
-              { $match: { status: { $in: ATIVOS }, dataAtualizacao: { $lte: d24h } } },
-              { $count: "v" },
-            ],
+            atrasados24h: [{ $match: { status: { $in: ATIVOS }, dataAtualizacao: { $lte: d24h } } }, { $count: "v" }],
 
             ultimos7dias: [
               { $match: { createdAt: { $gte: d7 } } },
@@ -763,28 +876,4 @@ export default class AtendimentoController {
       return fail(res, error, "Erro ao buscar métricas atuais");
     }
   }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-}
-
-// =========================
-// helpers
-// =========================
-function pickDefined<T extends object>(obj: T) {
-  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
 }

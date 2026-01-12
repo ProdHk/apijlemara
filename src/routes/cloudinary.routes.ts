@@ -1,5 +1,5 @@
-// src/routes/cloudinary.routes.ts
 import { Router } from "express";
+import multer from "multer";
 import Console, { ConsoleData } from "../lib/Console";
 import CloudinaryController from "../controllers/cloudinary.controller";
 
@@ -7,8 +7,23 @@ const router = Router();
 const cloudinaryController = new CloudinaryController();
 
 /* -------------------------------------------------------------------------- */
-/*  HELPERS                                                                   */
+/* Multer                                                                     */
 /* -------------------------------------------------------------------------- */
+/**
+ * Upload temporário em disco.
+ * O controller se encarrega de limpar o arquivo após o upload.
+ */
+const upload = multer({
+  dest: "/tmp",
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
+
 function ok(res: any, data: any, status = 200) {
   return res.status(status).json(data);
 }
@@ -33,7 +48,7 @@ function asResourceType(v: any): "image" | "video" | "raw" {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  ROTAS                                                                     */
+/* Rotas                                                                      */
 /* -------------------------------------------------------------------------- */
 
 /**
@@ -41,11 +56,15 @@ function asResourceType(v: any): "image" | "video" | "raw" {
  */
 router.get("/health", async (_req, res) => {
   Console({ type: "log", message: "GET /api/cloudinary/health" });
+
   try {
     return ok(res, {
       status: true,
       message: "cloudinary ok",
-      data: { uptime: process.uptime(), now: new Date().toISOString() },
+      data: {
+        uptime: process.uptime(),
+        now: new Date().toISOString(),
+      },
     });
   } catch (error) {
     return err(res, error, "Erro no health");
@@ -55,7 +74,6 @@ router.get("/health", async (_req, res) => {
 /**
  * POST /api/cloudinary/resource
  * Body: { public_id: string }
- * Retorna detalhes do recurso (uso interno / debug).
  */
 router.post("/resource", async (req, res) => {
   Console({ type: "log", message: "POST /api/cloudinary/resource" });
@@ -76,7 +94,11 @@ router.post("/resource", async (req, res) => {
     if (!data) {
       return ok(
         res,
-        { status: false, message: "Recurso não encontrado/erro ao buscar.", data: null },
+        {
+          status: false,
+          message: "Recurso não encontrado ou erro ao buscar.",
+          data: null,
+        },
         404
       );
     }
@@ -94,7 +116,7 @@ router.post("/resource", async (req, res) => {
 /**
  * POST /api/cloudinary/delete
  * Body:
- *  { public_id: string, resource_type?: "image"|"video"|"raw" }
+ * { public_id: string, resource_type?: "image" | "video" | "raw" }
  */
 router.post("/delete", async (req, res) => {
   Console({ type: "log", message: "POST /api/cloudinary/delete" });
@@ -111,7 +133,10 @@ router.post("/delete", async (req, res) => {
       );
     }
 
-    const result = await cloudinaryController.deleteFile(public_id, resource_type);
+    const result = await cloudinaryController.deleteFile(
+      public_id,
+      resource_type
+    );
 
     if (!result) {
       return ok(
@@ -123,7 +148,7 @@ router.post("/delete", async (req, res) => {
 
     return ok(res, {
       status: true,
-      message: "Arquivo deletado.",
+      message: "Arquivo deletado com sucesso.",
       data: { public_id, resource_type, result },
     });
   } catch (error) {
@@ -133,20 +158,17 @@ router.post("/delete", async (req, res) => {
 
 /**
  * POST /api/cloudinary/upload
- * ⚠️ Este endpoint NÃO recebe arquivo binário (multipart) por enquanto.
- * Ele existe para cenários internos onde você já tem um filePath NO SERVIDOR.
+ * Upload via filePath (uso interno / server-side)
  *
  * Body:
- *  { filePath: string, folder?: string }
- *
- * Ex: filePath="/tmp/wa-media-123"
+ * { filePath: string, folder?: string }
  */
 router.post("/upload", async (req, res) => {
   Console({ type: "log", message: "POST /api/cloudinary/upload" });
 
   try {
     const filePath = pickString(req.body?.filePath);
-    const folder = pickString(req.body?.folder) || undefined;
+    const folder = pickString(req.body?.folder) || 'undefined';
 
     if (!filePath) {
       return ok(
@@ -156,12 +178,15 @@ router.post("/upload", async (req, res) => {
       );
     }
 
-    const upload = await cloudinaryController.uploadFile(filePath, folder);
+    const uploadResult = await cloudinaryController.uploadFile(
+      filePath,
+      folder
+    );
 
-    if (!upload) {
+    if (!uploadResult) {
       return ok(
         res,
-        { status: false, message: "Falha no upload para Cloudinary.", data: null },
+        { status: false, message: "Falha no upload.", data: null },
         500
       );
     }
@@ -169,12 +194,60 @@ router.post("/upload", async (req, res) => {
     return ok(res, {
       status: true,
       message: "Upload realizado com sucesso.",
-      data: upload,
+      data: uploadResult,
     });
   } catch (error) {
     return err(res, error, "Erro ao fazer upload");
   }
 });
 
-const cloudinaryRoutes = router;
-export default cloudinaryRoutes;
+/**
+ * POST /api/cloudinary/upload-multipart
+ * Upload vindo do FRONT-END
+ *
+ * FormData:
+ *  file   -> arquivo
+ *  folder -> opcional
+ */
+router.post(
+  "/upload-multipart",
+  upload.single("file"),
+  async (req, res) => {
+    Console({ type: "log", message: "POST /api/cloudinary/upload-multipart" });
+
+    try {
+      if (!req.file) {
+        return ok(
+          res,
+          { status: false, message: "Arquivo não enviado.", data: null },
+          400
+        );
+      }
+
+      const folder = pickString(req.body?.folder) || undefined;
+
+      const uploadResult = await cloudinaryController.uploadMultipart(
+        req.file,
+        folder
+      );
+
+      if (!uploadResult) {
+        return ok(
+          res,
+          { status: false, message: "Falha no upload multipart.", data: null },
+          500
+        );
+      }
+
+      return ok(res, {
+        status: true,
+        message: "Upload multipart realizado com sucesso.",
+        data: uploadResult,
+      });
+    } catch (error) {
+      return err(res, error, "Erro no upload multipart");
+    }
+  }
+);
+
+export default router;

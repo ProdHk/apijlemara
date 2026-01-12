@@ -7,8 +7,9 @@ const router = Router();
 const mensagemController = new MensagemController();
 
 /* -------------------------------------------------------------------------- */
-/*  HELPERS                                                                   */
+/* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
+
 function digits(v?: string | null) {
   if (!v) return "";
   return String(v).replace(/\D+/g, "");
@@ -23,11 +24,25 @@ function clamp(n: number, min: number, max: number) {
   return Math.min(Math.max(n, min), max);
 }
 
-function ok(res: any, data: any, status = 200) {
-  return res.status(status).json(data);
+function ok(res: any, message: string, data: any, status = 200, extra?: Record<string, any>) {
+  return res.status(status).json({
+    status: true,
+    message,
+    data,
+    ...(extra ? extra : {}),
+  });
 }
 
-function err(res: any, error: unknown, fallback: string, status = 500) {
+function bad(res: any, message: string, data: any = null, status = 400, extra?: Record<string, any>) {
+  return res.status(status).json({
+    status: false,
+    message,
+    data,
+    ...(extra ? extra : {}),
+  });
+}
+
+function fail(res: any, error: unknown, fallback: string, status = 500) {
   const message = error instanceof Error ? error.message : fallback;
   Console({ type: "error", message });
   ConsoleData({ type: "error", data: error });
@@ -35,45 +50,50 @@ function err(res: any, error: unknown, fallback: string, status = 500) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  ROTAS                                                                     */
+/* Rotas                                                                      */
 /* -------------------------------------------------------------------------- */
 
 /**
  * GET /api/mensagens/health
  */
-router.get("/health", async (req, res) => {
+router.get("/health", async (_req, res) => {
   Console({ type: "log", message: "GET /api/mensagens/health" });
+
   try {
-    return ok(res, {
-      status: true,
-      message: "mensagem ok",
-      data: { uptime: process.uptime(), now: new Date().toISOString() },
-    });
+    return ok(
+      res,
+      "mensagem ok",
+      { uptime: process.uptime(), now: new Date().toISOString() },
+      200
+    );
   } catch (error) {
-    return err(res, error, "Erro no health");
+    return fail(res, error, "Erro no health");
   }
 });
 
 /**
  * POST /api/mensagens/webhook
- * (opcional) endpoint para testar/processar manualmente o payload do webhook da Meta
+ * Endpoint para testar/processar manualmente o payload do webhook da Meta
  */
 router.post("/webhook", async (req, res) => {
   Console({ type: "log", message: "POST /api/mensagens/webhook" });
+
   try {
     const result = await mensagemController.processWebhook(req.body);
-    return ok(res, result);
+    // o controller já devolve { status, message, data }
+    return res.status(200).json(result);
   } catch (error) {
-    return err(res, error, "Erro ao processar webhook");
+    return fail(res, error, "Erro ao processar webhook");
   }
 });
 
 /**
  * GET /api/mensagens/atendimento/:atendimentoId
- * Lista mensagens vinculadas a um atendimento (ordenadas asc no controller)
+ * Lista mensagens vinculadas a um atendimento (ordenadas no controller)
  */
 router.get("/atendimento/:atendimentoId", async (req, res) => {
-  const { atendimentoId } = req.params;
+  const atendimentoId = String(req.params.atendimentoId || "").trim();
+
   Console({
     type: "log",
     message: `GET /api/mensagens/atendimento/${atendimentoId}`,
@@ -81,22 +101,16 @@ router.get("/atendimento/:atendimentoId", async (req, res) => {
 
   try {
     if (!atendimentoId) {
-      return ok(res, {
-        status: false,
-        message: "atendimentoId não informado.",
-        data: [],
-      }, 400);
+      return bad(res, "atendimentoId não informado.", [], 400);
     }
 
     const data = await mensagemController.listarPorAtendimento(atendimentoId);
 
-    return ok(res, {
-      status: true,
-      message: "Mensagens do atendimento encontradas.",
-      data,
+    return ok(res, "Mensagens do atendimento encontradas.", data, 200, {
+      meta: { atendimentoId, total: data.length },
     });
   } catch (error) {
-    return err(res, error, "Erro ao listar mensagens por atendimento");
+    return fail(res, error, "Erro ao listar mensagens por atendimento");
   }
 });
 
@@ -118,19 +132,11 @@ router.get("/numero", async (req, res) => {
     const limit = clamp(toInt(req.query.limit, 50), 1, 500);
 
     if (!phoneNumberId) {
-      return ok(res, {
-        status: false,
-        message: "phoneNumberId não informado.",
-        data: [],
-      }, 400);
+      return bad(res, "phoneNumberId não informado.", [], 400);
     }
 
     if (!from) {
-      return ok(res, {
-        status: false,
-        message: "from (telefone do cliente) não informado.",
-        data: [],
-      }, 400);
+      return bad(res, "from (telefone do cliente) não informado.", [], 400);
     }
 
     const data = await mensagemController.listarPorNumero({
@@ -139,16 +145,12 @@ router.get("/numero", async (req, res) => {
       limit,
     });
 
-    return ok(res, {
-      status: true,
-      message: "Mensagens encontradas.",
-      data,
+    return ok(res, "Mensagens encontradas.", data, 200, {
       meta: { phoneNumberId, from, limit, total: data.length },
     });
   } catch (error) {
-    return err(res, error, "Erro ao listar mensagens por número");
+    return fail(res, error, "Erro ao listar mensagens por número");
   }
 });
 
-const mensagemRoutes = router;
-export default mensagemRoutes;
+export default router;

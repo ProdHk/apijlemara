@@ -1,76 +1,36 @@
 // src/controllers/metawebhook.controller.ts
-import axios from "axios";
-import fs from "fs";
-import os from "os";
-import path from "path";
-
+import type { Request, Response } from "express";
 import Console, { ConsoleData } from "../lib/Console";
 
-import MensagemController from "../controllers/mensagem.controller";
-import AtendimentoController from "../controllers/atendimento.controller";
+import Atendimento from "../models/Atendimento";
+import MensagemModel, { MensagemTipo, MensagemMainStatus } from "../models/Mensagem";
+import MetaController from "./meta.controller";
+import { normalizeBRBase10 } from "../lib/phone";
 
-import CloudinaryController from "../controllers/cloudinary.controller";
-
-type WebhookMessage = {
-  id?: string;
-  from?: string;
-  timestamp?: string; // seconds (string)
-  type?: string;
-
-  text?: { body?: string; preview_url?: boolean };
-
-  image?: { id?: string; mime_type?: string; sha256?: string; caption?: string;[k: string]: any };
-  audio?: { id?: string; mime_type?: string; sha256?: string;[k: string]: any };
-  video?: { id?: string; mime_type?: string; sha256?: string; caption?: string;[k: string]: any };
-  document?: { id?: string; mime_type?: string; sha256?: string; filename?: string; caption?: string;[k: string]: any };
-  sticker?: { id?: string; mime_type?: string; sha256?: string;[k: string]: any };
-
-  location?: any;
-  contacts?: any;
-  interactive?: any;
-  context?: any;
-  reaction?: any;
-
-  [k: string]: any;
-};
-
-type WebhookStatus = {
-  id?: string;
-  status?: string; // sent/delivered/read/failed...
-  timestamp?: string; // seconds
-  recipient_id?: string;
-  conversation?: { id?: string };
-  pricing?: any;
-  errors?: any[];
-  [k: string]: any;
-};
-
-type WebhookChangeValue = {
-  metadata?: { phone_number_id?: string; display_phone_number?: string; waba_id?: string };
-  contacts?: Array<{ wa_id?: string; profile?: { name?: string } }>;
-  messages?: Array<WebhookMessage>;
-  statuses?: Array<WebhookStatus>;
-  [k: string]: any;
-};
+/* -------------------------------------------------------------------------- */
+/* Types (Webhook Meta - mínimo necessário)                                   */
+/* -------------------------------------------------------------------------- */
 
 type WebhookBody = {
   object?: string;
   entry?: Array<{
     id?: string;
-    changes?: Array<{ field?: string; value?: WebhookChangeValue }>;
+    changes?: Array<{
+      field?: string;
+      value?: any;
+    }>;
   }>;
 };
+
+type WebhookValue = any;
+
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
 
 function digits(v?: string | null) {
   if (!v) return "";
   return String(v).replace(/\D+/g, "");
-}
-
-function toE164(raw?: string | number | null): string | undefined {
-  if (raw == null) return undefined;
-  const d = digits(String(raw));
-  if (!d) return undefined;
-  return d.startsWith("55") ? d : `55${d}`;
 }
 
 function toDateFromSeconds(ts?: string | number | null) {
@@ -80,330 +40,430 @@ function toDateFromSeconds(ts?: string | number | null) {
   return new Date(n * 1000);
 }
 
-function safeUnlink(filePath: string) {
-  try {
-    fs.unlinkSync(filePath);
-  } catch {
-    // ignore
-  }
+function isWithinDays(date: Date, days: number) {
+  const ms = days * 24 * 60 * 60 * 1000;
+  return Date.now() - date.getTime() <= ms;
 }
 
-function mapStatus(status?: string) {
-  const s = String(status || "").toLowerCase();
-  const map: Record<string, "SENT" | "DELIVERED" | "READ" | "FAILED" | "PENDING" | "RECEIVED"> = {
-    sent: "SENT",
-    delivered: "DELIVERED",
-    read: "READ",
-    failed: "FAILED",
-    undelivered: "FAILED",
-    deleted: "FAILED",
-    pending: "PENDING",
-    received: "RECEIVED",
-  };
-  return map[s] ?? "FAILED";
+function getValues(body: WebhookBody): WebhookValue[] {
+  const out: WebhookValue[] = [];
+  const entry = body?.entry || [];
+  for (const e of entry) {
+    const changes = e?.changes || [];
+    for (const c of changes) {
+      if (c?.value) out.push(c.value);
+    }
+  }
+  return out;
 }
+
+function safeTipo(msgType: any): MensagemTipo {
+  const t = String(msgType || "unknown").toLowerCase();
+  const allowed = new Set([
+    "text",
+    "image",
+    "audio",
+    "video",
+    "document",
+    "sticker",
+    "location",
+    "contacts",
+    "interactive",
+    "template",
+    "reaction",
+    "unknown",
+  ]);
+  return (allowed.has(t) ? t : "unknown") as MensagemTipo;
+}
+
+function mapStatusToMain(s?: string): MensagemMainStatus {
+  const v = String(s || "").toUpperCase();
+  if (v === "SENT") return "SENT";
+  if (v === "DELIVERED") return "DELIVERED";
+  if (v === "READ") return "READ";
+  if (v === "FAILED") return "FAILED";
+  // recebido via webhook (inbound) nós gravamos como RECEIVED
+  return "PENDING";
+}
+
+function pickDefined<T extends object>(obj: T) {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Controller                                                                 */
+/* -------------------------------------------------------------------------- */
 
 export default class MetaWebhookController {
-  private mensagens = new MensagemController();
-  private atendimentos = new AtendimentoController();
-  private cloudinary = new CloudinaryController();
+  private meta = new MetaController();
 
-  // ============================================================
-  // CONFIG (Graph API)
-  // ============================================================
-  private getMetaToken() {
-    const token =
-      process.env.WHATSAPP_TOKEN ||
-      process.env.WHATSAPP_CLOUD_API_TOKEN ||
-      process.env.META_WA_TOKEN;
+  private defaultTipoAtendimento = process.env.META_DEFAULT_TIPO_ATENDIMENTO || "outro";
+  private reopenWindowDays = 3;
 
-    if (!token) {
-      throw new Error("Defina WHATSAPP_TOKEN (ou WHATSAPP_CLOUD_API_TOKEN / META_WA_TOKEN) no .env");
-    }
-    return token;
-  }
-
-  private getGraphBase() {
-    return process.env.WHATSAPP_GRAPH_BASE || "https://graph.facebook.com";
-  }
-
-  private getApiVersion() {
-    return process.env.WHATSAPP_API_VERSION || "v21.0";
-  }
-
-  // ============================================================
-  // PARSERS (Value)
-  // ============================================================
-  private extractPhoneNumberId(value?: WebhookChangeValue) {
-    const phoneNumberId = value?.metadata?.phone_number_id;
-    return phoneNumberId ? String(phoneNumberId) : "";
-  }
-
-  private extractClientE164(value?: WebhookChangeValue) {
-    const waId = value?.contacts?.[0]?.wa_id;
-    return toE164(waId);
-  }
-
-  private extractClientName(value?: WebhookChangeValue) {
-    return value?.contacts?.[0]?.profile?.name || "";
-  }
-
-  private hasContacts(value?: WebhookChangeValue) {
-    return Array.isArray(value?.contacts) && value!.contacts!.length > 0;
-  }
-
-  private getMessages(value?: WebhookChangeValue) {
-    return Array.isArray(value?.messages) ? value!.messages! : [];
-  }
-
-  private getStatuses(value?: WebhookChangeValue) {
-    return Array.isArray(value?.statuses) ? value!.statuses! : [];
-  }
-
-  // ============================================================
-  // MEDIA HELPERS
-  // ============================================================
-  private extractMediaInfo(msg: WebhookMessage): { kind: "image" | "audio" | "video" | "document" | "sticker"; id: string } | null {
-    if (msg.image?.id) return { kind: "image", id: String(msg.image.id) };
-    if (msg.audio?.id) return { kind: "audio", id: String(msg.audio.id) };
-    if (msg.video?.id) return { kind: "video", id: String(msg.video.id) };
-    if (msg.document?.id) return { kind: "document", id: String(msg.document.id) };
-    if (msg.sticker?.id) return { kind: "sticker", id: String(msg.sticker.id) };
-    return null;
-  }
-
-  private buildCloudinaryFolder(kind: string) {
-    const base = "whatsapp";
-    if (kind === "image") return `${base}/images`;
-    if (kind === "audio") return `${base}/audios`;
-    if (kind === "video") return `${base}/videos`;
-    if (kind === "document") return `${base}/documents`;
-    if (kind === "sticker") return `${base}/stickers`;
-    return base;
-  }
-
-  private async downloadMediaToTempFile(mediaId: string): Promise<string> {
-    const token = this.getMetaToken();
-    const base = this.getGraphBase();
-    const version = this.getApiVersion();
-
-    // 1) get media metadata (url)
-    const metaUrl = `${base}/${version}/${mediaId}`;
-    const metaRes = await axios.get(metaUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    const fileUrl: string | undefined = metaRes.data?.url;
-    if (!fileUrl) throw new Error(`Não foi possível obter URL para mediaId ${mediaId}`);
-
-    // 2) download binary
-    const binRes = await axios.get<ArrayBuffer>(fileUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-      responseType: "arraybuffer",
-    });
-
-    const tmpDir = os.tmpdir();
-    const tmpPath = path.join(tmpDir, `wa-media-${mediaId}-${Date.now()}`);
-
-    fs.writeFileSync(tmpPath, Buffer.from(binRes.data));
-    return tmpPath;
-  }
-
-  private async uploadMediaToCloudinary(msg: WebhookMessage) {
-    const info = this.extractMediaInfo(msg);
-    if (!info?.id) return null;
-
-    const folder = this.buildCloudinaryFolder(info.kind);
-
+  /**
+   * Verificação do webhook (Meta)
+   * Meta envia:
+   *  hub.mode=subscribe
+   *  hub.verify_token=...
+   *  hub.challenge=...
+   */
+  verify(req: Request, res: Response) {
     try {
-      const tmpPath = await this.downloadMediaToTempFile(info.id);
+      const mode = String(req.query["hub.mode"] || "");
+      const token = String(req.query["hub.verify_token"] || "");
+      const challenge = String(req.query["hub.challenge"] || "");
 
-      // tudo público, retorna id da mídia
-      const upload = await this.cloudinary.uploadFile(tmpPath, folder);
+      const verifyToken = String(process.env.META_WEBHOOK_VERIFY_TOKEN || "a1");
 
-      safeUnlink(tmpPath);
+      if (mode === "subscribe" && token === verifyToken) {
+        return res.status(200).send(challenge);
+      }
 
-      if (!upload) return null;
-
-      return {
-        kind: info.kind,
-        whatsappMediaId: info.id,
-        cloudinaryPublicId: upload.public_id, // <- esse é o "id" pra salvar no DB
-        cloudinaryUrl: upload.secure_url || upload.url,
-        mime_type:
-          (msg as any)?.[info.kind]?.mime_type ||
-          upload.resource_type ||
-          undefined,
-        raw: upload,
-      };
+      return res.sendStatus(403);
     } catch (error) {
-      Console({ type: "error", message: `Falha upload media (Cloudinary): ${(error as Error).message}` });
-      ConsoleData({ type: "error", data: error });
-      return null;
+      return res.sendStatus(500);
     }
   }
 
-  // ============================================================
-  // INBOUND / OUTBOUND DETECTION
-  // ============================================================
-  private isInboundFromClient(value: WebhookChangeValue, msg: WebhookMessage) {
-    // Heurística simples e eficiente:
-    // - se veio contacts[] no payload, normalmente é inbound real do cliente
-    // - confirma: msg.from bate com wa_id
-    const clientE164 = this.extractClientE164(value);
-    if (!clientE164) return false;
+  /**
+   * Recebe webhook
+   * - salva mensagens inbound
+   * - atualiza status de mensagens
+   * - garante atendimento aberto / reabre fechado recente / cria novo
+   */
+  async receive(req: Request, res: Response) {
+    try {
+      const body = req.body as WebhookBody;
 
-    const fromE164 = toE164(msg?.from);
-    return !!(fromE164 && fromE164 === clientE164);
+      // resposta rápida para a Meta
+      res.status(200).json({ status: true });
+
+      // processa em seguida (no mesmo ciclo, mas resposta já foi enviada)
+      await this.processWebhook(body);
+    } catch (error) {
+      Console({ type: "error", message: "Erro geral no receive do webhook." });
+      ConsoleData({ type: "error", data: error });
+      // se já respondeu, não dá pra alterar; se não respondeu, manda 500
+      try {
+        if (!res.headersSent) return res.status(500).json({ status: false, message: "Erro interno" });
+      } catch { }
+    }
   }
 
-  // ============================================================
-  // PROCESS: MESSAGES
-  // ============================================================
-  private async processMessages(value: WebhookChangeValue) {
-    const phoneNumberId = this.extractPhoneNumberId(value);
+  /* ------------------------------------------------------------------------ */
+  /* Core processing                                                           */
+  /* ------------------------------------------------------------------------ */
+
+  async processWebhook(body: WebhookBody) {
+    try {
+      if (body?.object !== "whatsapp_business_account") {
+        return { status: true, message: "Ignorado (object != whatsapp_business_account)" };
+      }
+
+      const values = getValues(body);
+
+      for (const value of values) {
+        await this.processInboundMessages(value, body);
+        await this.processStatuses(value);
+      }
+
+      return { status: true, message: "Webhook processado." };
+    } catch (error) {
+      Console({ type: "error", message: "Erro ao processar webhook." });
+      ConsoleData({ type: "error", data: error });
+      return { status: false, message: "Erro ao processar webhook." };
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Inbound messages                                                          */
+  /* ------------------------------------------------------------------------ */
+
+  private getMessages(value: WebhookValue) {
+    const messages = value?.messages;
+    return Array.isArray(messages) ? messages : [];
+  }
+
+  private getContacts(value: WebhookValue) {
+    const contacts = value?.contacts;
+    return Array.isArray(contacts) ? contacts : [];
+  }
+
+  private getMetadata(value: WebhookValue) {
+    const md = value?.metadata || {};
+    return {
+      phoneNumberId: md?.phone_number_id ? String(md.phone_number_id) : undefined,
+      displayPhone: md?.display_phone_number ? String(md.display_phone_number) : undefined,
+      wabaId: md?.waba_id ? String(md.waba_id) : undefined,
+    };
+  }
+
+  private async processInboundMessages(value: WebhookValue, rawBody: WebhookBody) {
     const messages = this.getMessages(value);
     if (!messages.length) return;
 
-    const clientE164 = this.extractClientE164(value); // cliente (quando tiver contacts)
-    const clientName = this.extractClientName(value);
+    const contacts = this.getContacts(value);
+    const meta = this.getMetadata(value);
 
     for (const msg of messages) {
-      try {
-        const wamid = msg?.id;
-        if (!wamid) continue;
+      const wamid = String(msg?.id || "");
+      if (!wamid) continue;
 
-        // OUTBOUND echo (sem contacts) => salva/atualiza na Mensagem, mas não cria atendimento aqui
-        if (!this.hasContacts(value)) {
-          await this.mensagens.processWebhook({
-            object: "whatsapp_business_account",
-            entry: [{ changes: [{ value: { ...value, messages: [msg] } }] }],
-          });
-          continue;
+      const from = digits(msg?.from);
+      const type = safeTipo(msg?.type);
+
+      // nome do cliente (se veio em contacts)
+      const contact = contacts.find((c: any) => digits(c?.wa_id) === from);
+      const clienteNome = contact?.profile?.name ? String(contact.profile.name) : "";
+
+      // garante atendimento
+      const atendimento = await this.ensureAtendimento({
+        numeroWhatsapp: from,
+        clienteId: from, // por enquanto: clienteId = número (mapeamento externo pode vir depois)
+        clienteNome,
+      });
+
+      // monta doc base
+      const baseDoc: any = {
+        wamid,
+        messageId: wamid,
+        direction: "INBOUND",
+        status: "RECEIVED",
+        type,
+        from,
+        phoneNumberId: meta.phoneNumberId,
+        wabaId: meta.wabaId,
+        metaTimestamp: toDateFromSeconds(msg?.timestamp),
+        atendimentoId: atendimento?._id,
+        raw: rawBody,
+      };
+
+      // conteúdo por tipo
+      if (type === "text") {
+        baseDoc.text = { body: msg?.text?.body, preview_url: true };
+      }
+
+      if (["image", "audio", "video", "document", "sticker"].includes(type)) {
+        const mediaObj = msg?.[type] || {};
+        baseDoc.media = {
+          kind: type,
+          id: mediaObj?.id,
+          mime_type: mediaObj?.mime_type,
+          sha256: mediaObj?.sha256,
+          filename: mediaObj?.filename,
+          caption: mediaObj?.caption,
+        };
+
+        // se tiver media id: baixa e sobe pro Cloudinary (evita depender do Graph depois)
+        if (mediaObj?.id) {
+          try {
+            const saved = await this.meta.saveInboundMediaToCloudinary(String(mediaObj.id), "meta/inbound");
+            if (saved?.cloudinary?.secure_url) {
+              baseDoc.media.link = saved.cloudinary.secure_url;
+              baseDoc.media.meta = {
+                ...(baseDoc.media.meta || {}),
+                cloudinary: saved.cloudinary,
+                meta: saved.meta,
+              };
+            }
+          } catch (e) {
+            // não falha o webhook por isso — só registra
+            Console({ type: "error", message: "Falha ao salvar mídia inbound no Cloudinary." });
+            ConsoleData({ type: "error", data: e });
+          }
         }
+      }
 
-        // INBOUND real do cliente
-        const isInbound = this.isInboundFromClient(value, msg);
-        if (!isInbound) continue;
+      if (type === "interactive") {
+        const inter = msg?.interactive || {};
+        const reply = inter?.button_reply || inter?.list_reply;
+        baseDoc.interactive = {
+          type: inter?.type || "unknown",
+          id: reply?.id,
+          title: reply?.title,
+          description: reply?.description,
+          payload: reply?.id,
+          raw: inter,
+        };
+      }
 
-        // 1) Se tiver media -> baixa + manda pro Cloudinary e injeta no payload como "link"
-        const mediaUp = await this.uploadMediaToCloudinary(msg);
+      if (type === "location") {
+        const loc = msg?.location || {};
+        baseDoc.location = {
+          latitude: loc?.latitude,
+          longitude: loc?.longitude,
+          name: loc?.name,
+          address: loc?.address,
+          url: loc?.url,
+          raw: loc,
+        };
+      }
 
-        // 2) Persistir mensagem (idempotente)
-        const saveRes = await this.mensagens.processWebhook({
-          object: "whatsapp_business_account",
-          entry: [
-            {
-              changes: [
-                {
-                  value: {
-                    ...value,
-                    messages: [
-                      {
-                        ...msg,
-                        __mediaUpload: mediaUp || undefined, // opcional (fica dentro do raw)
-                      },
-                    ],
-                  },
-                },
-              ],
+      if (type === "contacts") {
+        baseDoc.contacts = Array.isArray(msg?.contacts) ? msg.contacts : [];
+      }
+
+      if (type === "reaction") {
+        const r = msg?.reaction || {};
+        baseDoc.reaction = {
+          message_id: r?.message_id,
+          emoji: r?.emoji,
+          raw: r,
+        };
+      }
+
+      const { wamid: _ignoreWamid, ...baseDocNoWamid } = baseDoc;
+
+      const saved = await MensagemModel.findOneAndUpdate(
+        { wamid },
+        {
+          $setOnInsert: { wamid },
+          $set: pickDefined(baseDocNoWamid),
+          $push: {
+            statuses: {
+              status: "RECEIVED",
+              timestamp: baseDoc.metaTimestamp || new Date(),
+              raw: rawBody,
             },
-          ],
-        });
-
-        // MensagemController retorna lista; vamos pegar a primeira salva
-        const savedMsg = (saveRes as any)?.data?.messages?.[0];
-        if (!savedMsg?._id) continue;
-
-        // 3) Vincular/garantir atendimento e anexar mensagem
-        // - clienteId: por enquanto, use o próprio telefone (sem complicar)
-        const atendimento = await this.atendimentos.ensure({
-          numeroWhatsapp: clientE164 || msg.from || "",
-          tipo: "outro",
-          clienteId: digits(clientE164 || msg.from || ""), // easycode: clienteId = telefone
-          clienteNome: clientName || "",
-          clienteRef: null,
-        });
-
-        if (!atendimento?._id) continue;
-
-        await this.atendimentos.anexarMensagem({
-          atendimentoId: String(atendimento._id),
-          mensagemId: String(savedMsg._id),
-          meta: {
-            direction: "INBOUND",
-            ts: savedMsg.metaTimestamp ? new Date(savedMsg.metaTimestamp) : toDateFromSeconds(msg.timestamp),
-            actor: "system",
           },
-        });
-      } catch (error) {
-        Console({ type: "error", message: "Erro ao processar messages." });
-        ConsoleData({ type: "error", data: error });
+        },
+        { upsert: true, new: true }
+      );
+
+
+      // vincula no atendimento + atualiza métricas
+      if (saved?._id && atendimento?._id) {
+        await Atendimento.updateOne(
+          { _id: atendimento._id },
+          {
+            $set: {
+              status: "aguardando-atendente",
+              dataAtualizacao: baseDoc.metaTimestamp || new Date(),
+              dataUltimaMensagemCliente: baseDoc.metaTimestamp || new Date(),
+              clienteNome: clienteNome || undefined,
+            },
+            $addToSet: { mensagens: saved._id },
+          }
+        );
       }
     }
   }
 
-  // ============================================================
-  // PROCESS: STATUSES
-  // ============================================================
-  private async processStatuses(value: WebhookChangeValue) {
+  /* ------------------------------------------------------------------------ */
+  /* Status updates                                                            */
+  /* ------------------------------------------------------------------------ */
+
+  private getStatuses(value: WebhookValue) {
+    const statuses = value?.statuses;
+    return Array.isArray(statuses) ? statuses : [];
+  }
+
+  private async processStatuses(value: WebhookValue) {
     const statuses = this.getStatuses(value);
     if (!statuses.length) return;
 
     for (const st of statuses) {
+      const wamid = String(st?.id || "");
+      if (!wamid) continue;
+
       try {
-        const wamid = String(st?.id || "");
-        if (!wamid) continue;
+        const main = mapStatusToMain(st?.status);
+        const ts = toDateFromSeconds(st?.timestamp) || new Date();
 
-        // atualiza via MensagemController (idempotente)
-        await this.mensagens.processWebhook({
-          object: "whatsapp_business_account",
-          entry: [{ changes: [{ value: { ...value, statuses: [st] } }] }],
-        });
+        await MensagemModel.updateOne(
+          { wamid },
+          {
+            $set: pickDefined({
+              status: main,
+              conversationId: st?.conversation?.id ? String(st.conversation.id) : undefined,
+              metaTimestamp: ts,
+            }),
+            $push: {
+              statuses: { status: main, timestamp: ts, raw: st },
+            },
+          }
+        );
 
-        // Opcional (regras):
-        // - Se status chegou para mensagem que não está vinculada a atendimento,
-        //   você pode tentar anexar. Mas sem "to" e sem phoneNumberId no Atendimento,
-        //   pode gerar ruído. Melhor anexar quando chegar "message" de fato.
-        //
-        // Se você quiser mesmo anexar em status:
-        // - Buscar a Mensagem por wamid (criar método no MensagemController)
-        // - Deducir cliente (from/to)
-        // - ensure() e anexarMensagem()
+        // se quiser: quando READ, você pode atualizar métricas do atendimento (opcional)
       } catch (error) {
-        Console({ type: "error", message: "Erro ao processar statuses." });
+        Console({ type: "error", message: "Erro ao processar status (Meta)." });
         ConsoleData({ type: "error", data: error });
       }
     }
   }
 
-  // ============================================================
-  // PROCESS: CHANGE.VALUE
-  // ============================================================
-  private async processChangeValue(value: WebhookChangeValue) {
-    await this.processMessages(value);
-    await this.processStatuses(value);
-  }
+  /* ------------------------------------------------------------------------ */
+  /* Atendimento rules                                                         */
+  /* ------------------------------------------------------------------------ */
 
-  // ============================================================
-  // ENTRYPOINT: BODY
-  // ============================================================
-  async handleWebhookBody(body: WebhookBody) {
-    try {
-      if (body?.object !== "whatsapp_business_account") return;
+  private async ensureAtendimento(params: {
+    numeroWhatsapp: string;
+    clienteId: string;
+    clienteNome?: string;
+  }) {
+    const numeroWhatsapp = normalizeBRBase10(params.numeroWhatsapp);
 
-      const entries = Array.isArray(body.entry) ? body.entry : [];
-      for (const entry of entries) {
-        const changes = Array.isArray(entry.changes) ? entry.changes : [];
-        for (const change of changes) {
-          const value = change?.value;
-          if (!value) continue;
-          await this.processChangeValue(value);
+    // 1) atendimento ativo
+    const ativo = await Atendimento.findOne({
+      numeroWhatsapp,
+      tipo: this.defaultTipoAtendimento,
+      status: { $in: ["aberto", "aguardando-atendente", "aguardando-cliente"] },
+    })
+      .sort({ dataAtualizacao: -1 })
+      .lean();
+
+    if (ativo) return ativo;
+
+    // 2) fechado recente (até N dias)
+    const fechado = await Atendimento.findOne({
+      numeroWhatsapp,
+      tipo: this.defaultTipoAtendimento,
+      status: { $in: ["fechado", "cancelado"] },
+    })
+      .sort({ dataFim: -1, dataAtualizacao: -1 })
+      .lean();
+
+    if (fechado?.dataFim && isWithinDays(new Date(fechado.dataFim), this.reopenWindowDays)) {
+      await Atendimento.updateOne(
+        { _id: fechado._id },
+        {
+          $set: {
+            status: "aberto",
+            dataFim: null,
+            dataAtualizacao: new Date(),
+          },
+          $push: {
+            historico: {
+              title: "Atendimento reaberto",
+              content: "Reaberto automaticamente por nova mensagem do cliente.",
+              date: new Date(),
+              user: "system",
+            },
+          },
         }
-      }
-    } catch (error) {
-      Console({ type: "error", message: "Erro geral no handleWebhookBody." });
-      ConsoleData({ type: "error", data: error });
+      );
+
+      const reopened = await Atendimento.findById(fechado._id).lean();
+      if (reopened) return reopened;
     }
+
+    // 3) cria novo
+    const created = await Atendimento.create({
+      tipo: this.defaultTipoAtendimento,
+      status: "aberto",
+      numeroWhatsapp,
+      clienteId: params.clienteId,
+      clienteNome: params.clienteNome || "",
+      historico: [
+        {
+          title: "Atendimento criado",
+          content: "Criado automaticamente via webhook da Meta.",
+          date: new Date(),
+          user: "system",
+        },
+      ],
+    });
+
+    return created.toObject();
   }
 }
