@@ -218,8 +218,7 @@ export default class MetaController {
   }
 
   private wabaIdOrDefault(input?: string) {
-    const v = String(input || "").trim();
-    return v ? v : this.defaultWabaId;
+    return this.defaultWabaId
   }
 
   private async ensureAtendimentoForOutbound(params: {
@@ -407,7 +406,7 @@ export default class MetaController {
 
   async listTemplates(wabaId?: string): Promise<MetaTemplateListResult> {
     const reqId = makeReqId("list_tpl");
-    const id = this.wabaIdOrDefault(wabaId);
+    const id = this.defaultWabaId
 
     Console({ type: "log", message: `[META][${reqId}] Listando templates wabaId=${id}` });
 

@@ -92,6 +92,33 @@ function toISO(d?: any) {
     return "";
   }
 }
+function buildTemplateComponentsFromVars(
+  vars: Record<string, string>
+) {
+  return [
+    {
+      type: "header",
+      parameters: Object.entries(vars)
+        .filter(([k]) => k === "nome")
+        .map(([_, v]) => ({
+          type: "text",
+          text: v,
+          parameter_name: "nome",
+        })),
+    },
+    {
+      type: "body",
+      parameters: Object.entries(vars)
+        .filter(([k]) => k !== "nome")
+        .map(([k, v]) => ({
+          type: "text",
+          text: v,
+          parameter_name: k,
+        })),
+    },
+  ].filter(c => c.parameters.length > 0);
+}
+
 
 /** lock TTL padrão (se um envio travar, recupera) */
 const DEFAULT_LOCK_TTL_MS = safeNumber(process.env.DISPARO_LOCK_TTL_MS, 60_000);
@@ -158,7 +185,7 @@ export default class DisparoController {
       // cria disparo
       const disparo = await Disparo.create({
         criadoPor,
-        atendenteId,
+        atendenteId: String(atendenteId),
         provider: "meta",
         status: "processando",
 
@@ -455,7 +482,7 @@ export default class DisparoController {
       const templateName = cleanStr(disparo.templateNome || disparo.templateId);
       const language = cleanStr(req.body?.language) || cleanStr(disparo.meta?.templateLanguage) || "pt_BR";
       const phoneNumberId = cleanStr(req.body?.phoneNumberId) || cleanStr(disparo.meta?.phoneNumberId) || undefined;
-      const components = req.body?.components;
+
 
       let sent = 0;
       let failed = 0;
@@ -483,7 +510,7 @@ export default class DisparoController {
           },
           { sort: { rowIndex: 1 }, new: true }
         ).lean();
-
+        const components = buildTemplateComponentsFromVars(item.vars);
         if (!item) break;
         reserved++;
 

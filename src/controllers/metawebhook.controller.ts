@@ -4,6 +4,10 @@ import Console, { ConsoleData } from "../lib/Console";
 
 import Atendimento from "../models/Atendimento";
 import MensagemModel, { MensagemTipo, MensagemMainStatus } from "../models/Mensagem";
+
+import Disparo from "../models/Disparo";
+import DisparoItem from "../models/DisparoItem";
+
 import MetaController from "./meta.controller";
 import { normalizeBRBase10 } from "../lib/phone";
 
@@ -17,12 +21,91 @@ type WebhookBody = {
     id?: string;
     changes?: Array<{
       field?: string;
-      value?: any;
+      value?: WebhookValue;
     }>;
   }>;
 };
 
-type WebhookValue = any;
+type WebhookValue = {
+  messaging_product?: string;
+
+  metadata?: {
+    display_phone_number?: string;
+    phone_number_id?: string;
+    waba_id?: string;
+  };
+
+  contacts?: Array<{
+    wa_id?: string;
+    profile?: { name?: string };
+  }>;
+
+  messages?: Array<{
+    from?: string;
+    id?: string;
+    timestamp?: string;
+    type?: string;
+
+    text?: { body?: string; preview_url?: boolean };
+
+    image?: MetaMedia;
+    audio?: MetaMedia;
+    video?: MetaMedia;
+    document?: MetaMedia;
+    sticker?: MetaMedia;
+
+    interactive?: {
+      type?: string;
+      button_reply?: { id?: string; title?: string };
+      list_reply?: { id?: string; title?: string; description?: string };
+      [k: string]: unknown;
+    };
+
+    location?: {
+      latitude?: number;
+      longitude?: number;
+      name?: string;
+      address?: string;
+      url?: string;
+      [k: string]: unknown;
+    };
+
+    contacts?: unknown[];
+
+    reaction?: {
+      message_id?: string;
+      emoji?: string;
+      [k: string]: unknown;
+    };
+
+    [k: string]: unknown;
+  }>;
+
+  statuses?: Array<{
+    id?: string;
+    status?: string;
+    timestamp?: string;
+
+    conversation?: { id?: string };
+
+    pricing?: unknown;
+    recipient_id?: string;
+
+    errors?: unknown[];
+    [k: string]: unknown;
+  }>;
+
+  [k: string]: unknown;
+};
+
+type MetaMedia = {
+  id?: string;
+  mime_type?: string;
+  sha256?: string;
+  filename?: string;
+  caption?: string;
+  [k: string]: unknown;
+};
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -57,7 +140,7 @@ function getValues(body: WebhookBody): WebhookValue[] {
   return out;
 }
 
-function safeTipo(msgType: any): MensagemTipo {
+function safeTipo(msgType: unknown): MensagemTipo {
   const t = String(msgType || "unknown").toLowerCase();
   const allowed = new Set([
     "text",
@@ -82,12 +165,33 @@ function mapStatusToMain(s?: string): MensagemMainStatus {
   if (v === "DELIVERED") return "DELIVERED";
   if (v === "READ") return "READ";
   if (v === "FAILED") return "FAILED";
-  // recebido via webhook (inbound) nós gravamos como RECEIVED
+  // inbound salvo como RECEIVED; aqui é status webhook
   return "PENDING";
 }
 
 function pickDefined<T extends object>(obj: T) {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
+}
+
+function startOfDaysAgo(days: number) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Disparo context                                                            */
+/* -------------------------------------------------------------------------- */
+
+type DisparoContext = {
+  disparoId?: string;
+  atendenteId?: string;
+  disparoStatus?: string;
+  itemId?: string;
+};
+
+function isActiveDisparoStatus(status?: string) {
+  const s = String(status || "").toLowerCase().trim();
+  // ajuste conforme seus enums reais (aqui: ativa = já rodou/rodando/pausado)
+  return s === "rodando" || s === "pausado" || s === "concluido";
 }
 
 /* -------------------------------------------------------------------------- */
@@ -97,8 +201,18 @@ function pickDefined<T extends object>(obj: T) {
 export default class MetaWebhookController {
   private meta = new MetaController();
 
-  private defaultTipoAtendimento = process.env.META_DEFAULT_TIPO_ATENDIMENTO || "outro";
+  private defaultTipoAtendimento = String(process.env.META_DEFAULT_TIPO_ATENDIMENTO || "outro").trim() || "outro";
+
+  /**
+   * Janela para reabrir atendimento fechado (mensagem inbound)
+   */
   private reopenWindowDays = 3;
+
+  /**
+   * Janela para achar disparo recente e vincular atendimento automaticamente
+   * (se existir DisparoItem/Disparo para o número)
+   */
+  private disparoLookbackDays = Number(process.env.META_DISPARO_LOOKBACK_DAYS || 3);
 
   /**
    * Verificação do webhook (Meta)
@@ -120,7 +234,7 @@ export default class MetaWebhookController {
       }
 
       return res.sendStatus(403);
-    } catch (error) {
+    } catch {
       return res.sendStatus(500);
     }
   }
@@ -130,6 +244,7 @@ export default class MetaWebhookController {
    * - salva mensagens inbound
    * - atualiza status de mensagens
    * - garante atendimento aberto / reabre fechado recente / cria novo
+   * - ✅ novo: tenta vincular ao Disparo/Atendente quando existir disparo recente
    */
   async receive(req: Request, res: Response) {
     try {
@@ -138,20 +253,21 @@ export default class MetaWebhookController {
       // resposta rápida para a Meta
       res.status(200).json({ status: true });
 
-      // processa em seguida (no mesmo ciclo, mas resposta já foi enviada)
+      // processa em seguida
       await this.processWebhook(body);
     } catch (error) {
       Console({ type: "error", message: "Erro geral no receive do webhook." });
       ConsoleData({ type: "error", data: error });
-      // se já respondeu, não dá pra alterar; se não respondeu, manda 500
       try {
         if (!res.headersSent) return res.status(500).json({ status: false, message: "Erro interno" });
-      } catch { }
+      } catch {
+        // ignore
+      }
     }
   }
 
   /* ------------------------------------------------------------------------ */
-  /* Core processing                                                           */
+  /* Core processing                                                          */
   /* ------------------------------------------------------------------------ */
 
   async processWebhook(body: WebhookBody) {
@@ -176,7 +292,7 @@ export default class MetaWebhookController {
   }
 
   /* ------------------------------------------------------------------------ */
-  /* Inbound messages                                                          */
+  /* Inbound messages                                                         */
   /* ------------------------------------------------------------------------ */
 
   private getMessages(value: WebhookValue) {
@@ -209,22 +325,30 @@ export default class MetaWebhookController {
       const wamid = String(msg?.id || "");
       if (!wamid) continue;
 
-      const from = digits(msg?.from);
+      const from = digits(String(msg?.from || ""));
+      if (!from) continue;
+
       const type = safeTipo(msg?.type);
 
       // nome do cliente (se veio em contacts)
-      const contact = contacts.find((c: any) => digits(c?.wa_id) === from);
+      const contact = contacts.find((c) => digits(String(c?.wa_id || "")) === from);
       const clienteNome = contact?.profile?.name ? String(contact.profile.name) : "";
 
-      // garante atendimento
+      // ✅ busca contexto de disparo (se existir disparo recente para o número)
+      const disparoCtx = await this.findDisparoContextByPhone(from);
+
+      // ✅ garante atendimento (e já tenta vincular atendente/disparo quando existir)
       const atendimento = await this.ensureAtendimento({
         numeroWhatsapp: from,
-        clienteId: from, // por enquanto: clienteId = número (mapeamento externo pode vir depois)
+        clienteId: from, // por enquanto: clienteId = número
         clienteNome,
+        disparoCtx,
       });
 
       // monta doc base
-      const baseDoc: any = {
+      const metaTs = toDateFromSeconds(msg?.timestamp);
+
+      const baseDoc: Record<string, unknown> = {
         wamid,
         messageId: wamid,
         direction: "INBOUND",
@@ -233,18 +357,18 @@ export default class MetaWebhookController {
         from,
         phoneNumberId: meta.phoneNumberId,
         wabaId: meta.wabaId,
-        metaTimestamp: toDateFromSeconds(msg?.timestamp),
-        atendimentoId: atendimento?._id,
+        metaTimestamp: metaTs,
+        atendimentoId: (atendimento as any)?._id,
         raw: rawBody,
       };
 
       // conteúdo por tipo
       if (type === "text") {
-        baseDoc.text = { body: msg?.text?.body, preview_url: true };
+        baseDoc.text = { body: (msg as any)?.text?.body, preview_url: true };
       }
 
       if (["image", "audio", "video", "document", "sticker"].includes(type)) {
-        const mediaObj = msg?.[type] || {};
+        const mediaObj = (msg as any)?.[type] as MetaMedia | undefined;
         baseDoc.media = {
           kind: type,
           id: mediaObj?.id,
@@ -254,20 +378,19 @@ export default class MetaWebhookController {
           caption: mediaObj?.caption,
         };
 
-        // se tiver media id: baixa e sobe pro Cloudinary (evita depender do Graph depois)
+        // se tiver media id: baixa e sobe pro Cloudinary
         if (mediaObj?.id) {
           try {
             const saved = await this.meta.saveInboundMediaToCloudinary(String(mediaObj.id), "meta/inbound");
             if (saved?.cloudinary?.secure_url) {
-              baseDoc.media.link = saved.cloudinary.secure_url;
-              baseDoc.media.meta = {
-                ...(baseDoc.media.meta || {}),
+              (baseDoc.media as any).link = saved.cloudinary.secure_url;
+              (baseDoc.media as any).meta = {
+                ...((baseDoc.media as any).meta || {}),
                 cloudinary: saved.cloudinary,
                 meta: saved.meta,
               };
             }
           } catch (e) {
-            // não falha o webhook por isso — só registra
             Console({ type: "error", message: "Falha ao salvar mídia inbound no Cloudinary." });
             ConsoleData({ type: "error", data: e });
           }
@@ -275,7 +398,7 @@ export default class MetaWebhookController {
       }
 
       if (type === "interactive") {
-        const inter = msg?.interactive || {};
+        const inter = (msg as any)?.interactive || {};
         const reply = inter?.button_reply || inter?.list_reply;
         baseDoc.interactive = {
           type: inter?.type || "unknown",
@@ -288,7 +411,7 @@ export default class MetaWebhookController {
       }
 
       if (type === "location") {
-        const loc = msg?.location || {};
+        const loc = (msg as any)?.location || {};
         baseDoc.location = {
           latitude: loc?.latitude,
           longitude: loc?.longitude,
@@ -300,11 +423,11 @@ export default class MetaWebhookController {
       }
 
       if (type === "contacts") {
-        baseDoc.contacts = Array.isArray(msg?.contacts) ? msg.contacts : [];
+        baseDoc.contacts = Array.isArray((msg as any)?.contacts) ? (msg as any).contacts : [];
       }
 
       if (type === "reaction") {
-        const r = msg?.reaction || {};
+        const r = (msg as any)?.reaction || {};
         baseDoc.reaction = {
           message_id: r?.message_id,
           emoji: r?.emoji,
@@ -322,7 +445,7 @@ export default class MetaWebhookController {
           $push: {
             statuses: {
               status: "RECEIVED",
-              timestamp: baseDoc.metaTimestamp || new Date(),
+              timestamp: metaTs || new Date(),
               raw: rawBody,
             },
           },
@@ -330,27 +453,50 @@ export default class MetaWebhookController {
         { upsert: true, new: true }
       );
 
-
       // vincula no atendimento + atualiza métricas
-      if (saved?._id && atendimento?._id) {
+      if (saved?._id && (atendimento as any)?._id) {
+        const now = metaTs || new Date();
+
         await Atendimento.updateOne(
-          { _id: atendimento._id },
+          { _id: (atendimento as any)._id },
           {
-            $set: {
+            $set: pickDefined({
               status: "aguardando-atendente",
-              dataAtualizacao: baseDoc.metaTimestamp || new Date(),
-              dataUltimaMensagemCliente: baseDoc.metaTimestamp || new Date(),
+              dataAtualizacao: now,
+              dataUltimaMensagemCliente: now,
               clienteNome: clienteNome || undefined,
-            },
+
+              // ✅ reforça vínculo (caso o atendimento tenha sido reaproveitado e ainda não tinha)
+              ...(disparoCtx?.disparoId ? { disparoId: disparoCtx.disparoId } : {}),
+              ...(disparoCtx?.atendenteId ? { atendenteId: disparoCtx.atendenteId } : {}),
+              ...(disparoCtx?.atendenteId ? { atendente: disparoCtx.atendenteId } : {}),
+            } as any),
             $addToSet: { mensagens: saved._id },
           }
         );
+
+        // ✅ marca item do disparo como "respondeu" (opcional, não quebra se não achar)
+        if (disparoCtx?.itemId) {
+          try {
+            await DisparoItem.updateOne(
+              { _id: disparoCtx.itemId },
+              {
+                $set: {
+                  status: "respondido",
+                  finishedAt: now,
+                },
+              }
+            );
+          } catch {
+            // ignore
+          }
+        }
       }
     }
   }
 
   /* ------------------------------------------------------------------------ */
-  /* Status updates                                                            */
+  /* Status updates                                                           */
   /* ------------------------------------------------------------------------ */
 
   private getStatuses(value: WebhookValue) {
@@ -370,6 +516,7 @@ export default class MetaWebhookController {
         const main = mapStatusToMain(st?.status);
         const ts = toDateFromSeconds(st?.timestamp) || new Date();
 
+        // atualiza mensagem
         await MensagemModel.updateOne(
           { wamid },
           {
@@ -384,7 +531,25 @@ export default class MetaWebhookController {
           }
         );
 
-        // se quiser: quando READ, você pode atualizar métricas do atendimento (opcional)
+        // ✅ atualiza DisparoItem.meta (quando a mensagem foi enviada por disparo)
+        // o sendNext normalmente salva messageId em DisparoItem.meta.messageId
+        const metaPatch: Record<string, unknown> = {
+          "meta.messageId": wamid,
+          "meta.lastStatus": String(st?.status || "").toUpperCase(),
+        };
+
+        if (main === "SENT") metaPatch["meta.sentAt"] = ts;
+        if (main === "DELIVERED") metaPatch["meta.deliveredAt"] = ts;
+        if (main === "READ") metaPatch["meta.readAt"] = ts;
+
+        await DisparoItem.updateOne(
+          { "meta.messageId": wamid },
+          {
+            $set: metaPatch,
+          }
+        );
+
+        // (opcional) se quiser atualizar atendimento quando READ/DELIVERED, faça aqui
       } catch (error) {
         Console({ type: "error", message: "Erro ao processar status (Meta)." });
         ConsoleData({ type: "error", data: error });
@@ -393,17 +558,71 @@ export default class MetaWebhookController {
   }
 
   /* ------------------------------------------------------------------------ */
-  /* Atendimento rules                                                         */
+  /* Disparo lookup                                                           */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Procura o último DisparoItem recente pelo telefone (phoneE164/phoneRaw),
+   * e retorna atendenteId + disparoId (se o disparo estiver ativo).
+   */
+  private async findDisparoContextByPhone(phone: string): Promise<DisparoContext | null> {
+    try {
+      const p = normalizeBRBase10(phone);
+      if (!p) return null;
+
+      const since = startOfDaysAgo(this.disparoLookbackDays);
+
+      // busca por item recente com o telefone
+      const item = await DisparoItem.findOne({
+        $and: [
+          {
+            $or: [{ phoneE164: p }, { phoneRaw: p }, { phoneRaw: phone }, { phoneE164: phone }],
+          },
+          { createdAt: { $gte: since } },
+        ],
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      if (!item?.disparoId) return null;
+
+      const disparo = await Disparo.findById(item.disparoId).lean();
+      if (!disparo) return null;
+
+      const disparoStatus = String((disparo as any)?.status || "");
+      if (!isActiveDisparoStatus(disparoStatus)) return null;
+
+      const atendenteId = String((disparo as any)?.atendenteId || "").trim();
+      const disparoId = String((disparo as any)?._id || "").trim();
+
+      return {
+        itemId: String((item as any)?._id || ""),
+        disparoId: disparoId || undefined,
+        atendenteId: atendenteId || undefined,
+        disparoStatus: disparoStatus || undefined,
+      };
+    } catch (e) {
+      Console({ type: "error", message: "Falha ao buscar contexto de Disparo pelo telefone." });
+      ConsoleData({ type: "error", data: e });
+      return null;
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Atendimento rules                                                        */
   /* ------------------------------------------------------------------------ */
 
   private async ensureAtendimento(params: {
     numeroWhatsapp: string;
     clienteId: string;
     clienteNome?: string;
+    disparoCtx?: DisparoContext | null;
   }) {
     const numeroWhatsapp = normalizeBRBase10(params.numeroWhatsapp);
+    const disparoCtx = params.disparoCtx || null;
 
-    // 1) atendimento ativo
+    // 0) ✅ se existir atendimento ativo E já estiver vinculado, só retorna
+    // (ou, se não estiver vinculado e existe ctx, faz "attach" no atendimento)
     const ativo = await Atendimento.findOne({
       numeroWhatsapp,
       tipo: this.defaultTipoAtendimento,
@@ -412,9 +631,41 @@ export default class MetaWebhookController {
       .sort({ dataAtualizacao: -1 })
       .lean();
 
-    if (ativo) return ativo;
+    if (ativo) {
+      // ✅ se veio um disparo ativo e o atendimento ainda não tem atendente/disparo, vincula
+      const needAttach =
+        Boolean(disparoCtx?.disparoId || disparoCtx?.atendenteId) &&
+        (!String((ativo as any)?.disparoId || "") || !String((ativo as any)?.atendenteId || (ativo as any)?.atendente || ""));
 
-    // 2) fechado recente (até N dias)
+      if (needAttach) {
+        await Atendimento.updateOne(
+          { _id: (ativo as any)._id },
+          {
+            $set: pickDefined({
+              ...(disparoCtx?.disparoId ? { disparoId: disparoCtx.disparoId } : {}),
+              ...(disparoCtx?.atendenteId ? { atendenteId: disparoCtx.atendenteId } : {}),
+              ...(disparoCtx?.atendenteId ? { atendente: disparoCtx.atendenteId } : {}),
+              dataAtualizacao: new Date(),
+            } as any),
+            $push: {
+              historico: {
+                title: "Vínculo automático (Disparo)",
+                content: `Atendimento vinculado automaticamente ao disparo${disparoCtx?.disparoId ? ` ${disparoCtx.disparoId}` : ""} (atendente ${disparoCtx?.atendenteId || "—"}).`,
+                date: new Date(),
+                user: "system",
+              },
+            },
+          }
+        );
+
+        const updated = await Atendimento.findById((ativo as any)._id).lean();
+        if (updated) return updated;
+      }
+
+      return ativo;
+    }
+
+    // 1) fechado recente (até N dias) -> reabre
     const fechado = await Atendimento.findOne({
       numeroWhatsapp,
       tipo: this.defaultTipoAtendimento,
@@ -425,13 +676,17 @@ export default class MetaWebhookController {
 
     if (fechado?.dataFim && isWithinDays(new Date(fechado.dataFim), this.reopenWindowDays)) {
       await Atendimento.updateOne(
-        { _id: fechado._id },
+        { _id: (fechado as any)._id },
         {
-          $set: {
+          $set: pickDefined({
             status: "aberto",
             dataFim: null,
             dataAtualizacao: new Date(),
-          },
+
+            ...(disparoCtx?.disparoId ? { disparoId: disparoCtx.disparoId } : {}),
+            ...(disparoCtx?.atendenteId ? { atendenteId: disparoCtx.atendenteId } : {}),
+            ...(disparoCtx?.atendenteId ? { atendente: disparoCtx.atendenteId } : {}),
+          } as any),
           $push: {
             historico: {
               title: "Atendimento reaberto",
@@ -443,21 +698,29 @@ export default class MetaWebhookController {
         }
       );
 
-      const reopened = await Atendimento.findById(fechado._id).lean();
+      const reopened = await Atendimento.findById((fechado as any)._id).lean();
       if (reopened) return reopened;
     }
 
-    // 3) cria novo
+    // 2) cria novo
     const created = await Atendimento.create({
       tipo: this.defaultTipoAtendimento,
       status: "aberto",
       numeroWhatsapp,
       clienteId: params.clienteId,
       clienteNome: params.clienteNome || "",
+
+      // ✅ se existe ctx de disparo, já cria com atendente/disparo
+      ...(disparoCtx?.disparoId ? { disparoId: disparoCtx.disparoId } : {}),
+      ...(disparoCtx?.atendenteId ? { atendenteId: disparoCtx.atendenteId } : {}),
+      ...(disparoCtx?.atendenteId ? { atendente: disparoCtx.atendenteId } : {}),
+
       historico: [
         {
           title: "Atendimento criado",
-          content: "Criado automaticamente via webhook da Meta.",
+          content: disparoCtx?.disparoId
+            ? `Criado automaticamente via webhook da Meta e vinculado ao disparo ${disparoCtx.disparoId} (atendente ${disparoCtx.atendenteId || "—"}).`
+            : "Criado automaticamente via webhook da Meta.",
           date: new Date(),
           user: "system",
         },
