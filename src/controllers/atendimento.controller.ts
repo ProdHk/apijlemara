@@ -782,6 +782,23 @@ export default class AtendimentoController {
       return fail(res, error, "Erro ao buscar atendimentos");
     }
   }
+  async buscarSemAtendente({ req, res }: { req: Request; res: Response }) {
+    Console({ type: "log", message: "GET /api/atendimento/atendimentos-sem-atendente" });
+
+    try {
+      const result = await Atendimento.find({ atendente: null }).lean();
+
+      const response: ResponseType = {
+        status: true,
+        message: "Atendimentos encontrados",
+        data: result.map(toPublic),
+      };
+
+      return ok(res, response);
+    } catch (error) {
+      return fail(res, error, "Erro ao buscar atendimentos");
+    }
+  }
 
   async buscarPorFila({ req, res }: { req: Request; res: Response }) {
     Console({ type: "log", message: "GET /api/atendimento/atendimentos-por-fila" });

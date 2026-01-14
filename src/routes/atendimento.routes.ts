@@ -68,6 +68,7 @@ function toSortBy(v: any): "updatedAt" | "createdAt" | "dataAtualizacao" | undef
 router.get("/atendimentos-ativos", (req, res) => controller.buscarAtivos({ req, res }));
 router.post("/atendimentos-ativos-atendente", (req, res) => controller.buscarAtivosAtendente({ req, res }));
 router.post("/atendimentos-por-status", (req, res) => controller.buscarPorStatus({ req, res }));
+router.get("/atendimentos-sem-atendente", (req, res) => controller.buscarSemAtendente({ req, res }));
 router.post("/atendimentos-por-fila", (req, res) => controller.buscarPorFila({ req, res }));
 router.get("/metricas-atuais", (req, res) => controller.buscarMetricasAtuais({ req, res }));
 
